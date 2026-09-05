@@ -1333,7 +1333,7 @@ def main():
 
     print()
     print("═" * 54)
-    print("  BACKUP ORGANIZER")
+    print("  BACKUP ORGANISER v1.0")
     print("═" * 54)
     print()
     print("  1. Single backup")
