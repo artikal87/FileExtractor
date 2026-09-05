@@ -11,7 +11,9 @@ Modes:
                       designed for a final dedup pass when all media
                       are done.
   3. Deduplicate    — standalone dedup of any folder.
-  4. Resume batch   — pick up a previous batch session where you left off.
+  4. Organise photos — sort images by date/album, optionally split
+                       real photos from icons/screenshots.
+  5. Resume batch   — pick up a previous batch session where you left off.
 
 Usage:
   python backup_organiser.py
@@ -23,11 +25,39 @@ import logging
 import os
 import platform
 import shutil
+import struct
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+
+# Optional: Pillow for EXIF and image dimensions
+try:
+    from PIL import Image as PILImage
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+
+def _install_pillow():
+    """Attempt to pip-install Pillow and reload it."""
+    global HAS_PIL, PILImage
+    import subprocess
+    print("  Installing Pillow...")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "Pillow", "--quiet"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        from PIL import Image as PILImage  # noqa: F811
+        HAS_PIL = True
+        print("  Pillow installed successfully.")
+    except Exception as e:
+        print(f"  Could not install Pillow: {e}")
+        print("  Continuing without it. You can install it manually:")
+        print(f"    {sys.executable} -m pip install Pillow")
 
 # ──────────────────────────────────────────────
 # File type categories
@@ -67,6 +97,34 @@ _EXT_TO_CATEGORY = {}
 for _cat, _exts in FILE_CATEGORIES.items():
     for _ext in _exts:
         _EXT_TO_CATEGORY[_ext] = _cat
+
+IMAGE_EXTENSIONS = FILE_CATEGORIES["Images"]
+
+# Photo detection constants
+RAW_EXTENSIONS = {
+    ".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2", ".raw",
+}
+LIKELY_PHOTO_EXTENSIONS = {
+    ".jpg", ".jpeg", ".heic", ".heif", ".tiff", ".tif",
+}
+SCREENSHOT_PATTERNS = [
+    "screenshot", "screen shot", "screen recording",
+    "snip", "capture", "grab", "screenclip",
+]
+SCREEN_RESOLUTIONS = {
+    (1920, 1080), (2560, 1440), (3840, 2160),  # 16:9
+    (1440, 900), (2880, 1800), (1680, 1050),    # Mac
+    (1366, 768), (1536, 864),                    # common laptop
+    (2560, 1600), (3024, 1964), (3456, 2234),    # Retina Mac
+    (1170, 2532), (1284, 2778), (1290, 2796),    # iPhone
+    (1179, 2556), (1242, 2688),                  # iPhone
+    (1080, 1920), (1440, 2560), (1080, 2400),    # Android
+}
+MIN_PHOTO_DIMENSION = 600
+
+# Album detection thresholds
+ALBUM_MIN_IMAGES = 5
+ALBUM_DENSITY_THRESHOLD = 0.6  # 60% of files must be images
 
 
 def get_category(filepath: Path) -> str:
@@ -136,7 +194,6 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
 
 
 def dest_free_space(dest: Path) -> int:
-    """Return free bytes on the filesystem containing dest."""
     try:
         target = dest if dest.exists() else dest.parent
         return shutil.disk_usage(target).free
@@ -457,7 +514,8 @@ class Deduplicator:
                     self.hash_index[h].append((fpath, mtime, size))
                     hashed += 1
                     if hashed % 500 == 0:
-                        logging.info(f"    … hashed {hashed:,} / {candidates:,}")
+                        logging.info(
+                            f"    … hashed {hashed:,} / {candidates:,}")
                 except OSError as e:
                     logging.warning(f"  Hash error: {fpath} ({e})")
                     self.errors += 1
@@ -510,7 +568,8 @@ class Deduplicator:
                     try:
                         dupe_path.unlink()
                     except OSError as e:
-                        logging.error(f"  Delete failed: {dupe_path} ({e})")
+                        logging.error(
+                            f"  Delete failed: {dupe_path} ({e})")
                         self.errors += 1
                         self.bytes_freed -= dupe_size
                         continue
@@ -556,18 +615,384 @@ class Deduplicator:
 
 
 # ──────────────────────────────────────────────
+# Photo organiser
+# ──────────────────────────────────────────────
+class PhotoOrganiser:
+    """
+    Organise image files by date and/or album. Optionally split
+    real photos from icons, screenshots, and other non-photo images.
+    """
+
+    def __init__(self, target: Path, strategy: str = "date",
+                 filter_photos: bool = False, dry_run: bool = False):
+        """
+        target:         folder containing images (e.g. backup/Images)
+        strategy:       "date", "album", or "album_date"
+        filter_photos:  if True, split into photo/ and _other/
+        dry_run:        preview moves without doing them
+        """
+        self.target = target.resolve()
+        self.strategy = strategy
+        self.filter_photos = filter_photos
+        self.dry_run = dry_run
+
+        # Stats
+        self.total_images = 0
+        self.moved_photo = 0
+        self.moved_other = 0
+        self.skipped = 0
+        self.errors = 0
+        self.albums_detected: list[dict] = []
+
+        # Source path mapping from manifests (dest filename → source path)
+        self._source_map: dict[str, str] = {}
+
+        # PIL notice printed once
+        self._pil_warned = False
+
+    def run(self):
+        start_time = time.time()
+        print()
+        logging.info(
+            f"{'DRY RUN — ' if self.dry_run else ''}"
+            f"Organising photos in: {self.target}"
+        )
+
+        if not HAS_PIL:
+            print()
+            print("  Pillow is not installed. Without it, photo")
+            print("  detection uses filename patterns and file")
+            print("  extensions only. With it, you get EXIF dates,")
+            print("  camera detection, and dimension checks.")
+            print()
+            if ask_yes_no("  Install Pillow now?", default=True):
+                _install_pillow()
+            print()
+
+        # Load any manifests for album detection
+        self._load_manifests()
+
+        # Collect all image files
+        images: list[Path] = []
+        for root, dirs, files in os.walk(self.target, followlinks=False,
+                                         onerror=lambda e: None):
+            dirs[:] = [d for d in dirs if not d.startswith(".")
+                       and d not in ("photo", "_other")]
+            for fname in files:
+                fpath = Path(root) / fname
+                if fpath.suffix.lower() in IMAGE_EXTENSIONS:
+                    images.append(fpath)
+
+        self.total_images = len(images)
+        print(f"  Found {self.total_images:,} image files.")
+
+        if self.total_images == 0:
+            print("  Nothing to organise.")
+            return
+
+        # Album detection (if strategy uses albums)
+        album_map: dict[str, str] = {}  # filename → album name
+        if self.strategy in ("album", "album_date"):
+            album_map = self._detect_albums(images)
+            if self.albums_detected:
+                self._preview_albums()
+
+        # Process each image
+        for fpath in images:
+            self._process_image(fpath, album_map)
+
+        elapsed = time.time() - start_time
+        self._print_summary(elapsed)
+
+        # Offer to go live after dry run
+        if self.dry_run and (self.moved_photo + self.moved_other) > 0:
+            print()
+            if ask_yes_no("Apply these changes?", default=True):
+                self.dry_run = False
+                self.moved_photo = 0
+                self.moved_other = 0
+                self.skipped = 0
+                self.errors = 0
+                for fpath in images:
+                    # Re-check — file may not exist if already moved
+                    if fpath.exists():
+                        self._process_image(fpath, album_map)
+                self._print_summary(0)
+
+    def _load_manifests(self):
+        """Load manifest files to map destination filenames to source paths."""
+        for item in self.target.iterdir():
+            if item.name.startswith("manifest_") and item.suffix == ".json":
+                try:
+                    with open(item) as f:
+                        data = json.load(f)
+                    for entry in data.get("files", []):
+                        dest_path = Path(entry.get("destination", ""))
+                        source_path = entry.get("source", "")
+                        if dest_path.name and source_path:
+                            self._source_map[dest_path.name] = source_path
+                except (json.JSONDecodeError, OSError):
+                    continue
+        if self._source_map:
+            print(f"  Loaded source paths for {len(self._source_map):,} "
+                  f"files from manifests.")
+
+    def _detect_albums(self, images: list[Path]) -> dict[str, str]:
+        """
+        Detect album folders using manifest source paths (preferred)
+        or current folder structure. Returns filename → album name.
+        """
+        album_map: dict[str, str] = {}
+
+        if self._source_map:
+            # Group by source parent directory
+            dir_files: dict[str, list[str]] = defaultdict(list)
+            dir_total: dict[str, int] = defaultdict(int)
+            dir_images: dict[str, int] = defaultdict(int)
+
+            for fname, source_path in self._source_map.items():
+                parent = str(Path(source_path).parent)
+                dir_total[parent] += 1
+                if Path(fname).suffix.lower() in IMAGE_EXTENSIONS:
+                    dir_images[parent] += 1
+                    dir_files[parent].append(fname)
+
+            for parent, img_count in dir_images.items():
+                total = dir_total[parent]
+                density = img_count / total if total > 0 else 0
+                if (img_count >= ALBUM_MIN_IMAGES
+                        and density >= ALBUM_DENSITY_THRESHOLD):
+                    album_name = Path(parent).name
+                    # Clean up album name
+                    album_name = album_name.strip().replace(" ", "_")
+                    if album_name:
+                        self.albums_detected.append({
+                            "name": album_name,
+                            "image_count": img_count,
+                            "density": density,
+                            "source_dir": parent,
+                        })
+                        for fname in dir_files[parent]:
+                            album_map[fname] = album_name
+
+        else:
+            # No manifests — use current folder structure
+            for root, dirs, files in os.walk(
+                    self.target, followlinks=False):
+                dirs[:] = [d for d in dirs if not d.startswith(".")
+                           and d not in ("photo", "_other")]
+                if root == str(self.target):
+                    continue  # skip root level
+                all_files = files
+                img_files = [f for f in files
+                             if Path(f).suffix.lower() in IMAGE_EXTENSIONS]
+                total = len(all_files)
+                img_count = len(img_files)
+                density = img_count / total if total > 0 else 0
+
+                if (img_count >= ALBUM_MIN_IMAGES
+                        and density >= ALBUM_DENSITY_THRESHOLD):
+                    album_name = Path(root).name.strip().replace(" ", "_")
+                    if album_name:
+                        self.albums_detected.append({
+                            "name": album_name,
+                            "image_count": img_count,
+                            "density": density,
+                            "source_dir": root,
+                        })
+                        for fname in img_files:
+                            fpath = Path(root) / fname
+                            album_map[fpath.name] = album_name
+
+        return album_map
+
+    def _preview_albums(self):
+        """Show detected albums for user review."""
+        print()
+        print(f"  Detected {len(self.albums_detected)} album(s):")
+        for a in sorted(self.albums_detected,
+                        key=lambda x: x["image_count"], reverse=True):
+            print(f"    {a['name']:<30s} {a['image_count']:>5} images  "
+                  f"({a['density']:.0%} density)")
+        print()
+
+    def _is_photo(self, fpath: Path) -> bool:
+        """Determine if an image is a real photo vs icon/screenshot."""
+        ext = fpath.suffix.lower()
+
+        # RAW formats are always photos
+        if ext in RAW_EXTENSIONS:
+            return True
+
+        fname_lower = fpath.stem.lower()
+
+        # Screenshot filename patterns
+        if any(pat in fname_lower for pat in SCREENSHOT_PATTERNS):
+            return False
+
+        if HAS_PIL:
+            try:
+                with PILImage.open(fpath) as img:
+                    w, h = img.size
+
+                    # Exact screen resolution match → screenshot
+                    if (w, h) in SCREEN_RESOLUTIONS or \
+                       (h, w) in SCREEN_RESOLUTIONS:
+                        return False
+
+                    # Too small on both axes → icon/thumbnail
+                    if (w < MIN_PHOTO_DIMENSION
+                            and h < MIN_PHOTO_DIMENSION):
+                        return False
+
+                    # EXIF camera make/model → definitely a photo
+                    exif = None
+                    try:
+                        exif = img._getexif()
+                    except Exception:
+                        pass
+                    if exif:
+                        if (271 in exif or 272 in exif):  # Make or Model
+                            return True
+
+                    # Large enough, no screenshot markers → probably photo
+                    return True
+            except Exception:
+                pass
+
+        # Without PIL: trust extension for likely photo formats
+        if ext in LIKELY_PHOTO_EXTENSIONS:
+            return True
+
+        # PNG, GIF, BMP, SVG, ICO etc. without PIL → assume not a photo
+        return False
+
+    def _get_photo_date(self, fpath: Path) -> tuple[str, str] | None:
+        """Get (year, month) from EXIF or file mtime."""
+        if HAS_PIL:
+            try:
+                with PILImage.open(fpath) as img:
+                    exif = None
+                    try:
+                        exif = img._getexif()
+                    except Exception:
+                        pass
+                    if exif and 36867 in exif:  # DateTimeOriginal
+                        date_str = str(exif[36867])
+                        parts = date_str.split(":")
+                        if len(parts) >= 2:
+                            year = parts[0].strip()
+                            month = parts[1].strip()
+                            if year.isdigit() and month.isdigit():
+                                return (year, f"{int(month):02d}")
+            except Exception:
+                pass
+
+        # Fallback: file modification time
+        try:
+            mtime = fpath.stat().st_mtime
+            dt = datetime.fromtimestamp(mtime)
+            return (str(dt.year), f"{dt.month:02d}")
+        except OSError:
+            return None
+
+    def _process_image(self, fpath: Path, album_map: dict[str, str]):
+        """Move a single image to its new location."""
+        is_photo = True
+        if self.filter_photos:
+            is_photo = self._is_photo(fpath)
+
+        # Determine destination subfolder
+        if self.filter_photos:
+            base = self.target / ("photo" if is_photo else "_other")
+        else:
+            base = self.target
+
+        # Choose subfolder based on strategy (only for photos or
+        # unfiltered mode)
+        if is_photo or not self.filter_photos:
+            album_name = album_map.get(fpath.name)
+
+            if self.strategy == "album" and album_name:
+                dest_dir = base / album_name
+            elif self.strategy == "album_date":
+                if album_name:
+                    dest_dir = base / album_name
+                else:
+                    date = self._get_photo_date(fpath)
+                    if date:
+                        dest_dir = base / date[0] / f"{date[0]}-{date[1]}"
+                    else:
+                        dest_dir = base / "_undated"
+            elif self.strategy == "date":
+                date = self._get_photo_date(fpath)
+                if date:
+                    dest_dir = base / date[0] / f"{date[0]}-{date[1]}"
+                else:
+                    dest_dir = base / "_undated"
+            else:
+                dest_dir = base
+        else:
+            # Non-photos go flat into _other
+            dest_dir = base
+
+        dest_path = dest_dir / fpath.name
+
+        # Skip if already in the right place
+        if dest_path == fpath:
+            self.skipped += 1
+            return
+
+        dest_path = unique_dest_path(dest_path)
+
+        if self.dry_run:
+            label = "photo" if is_photo else "other"
+            logging.info(f"  [{label}] {fpath.name}  →  {dest_path}")
+        else:
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(fpath), str(dest_path))
+            except OSError as e:
+                logging.error(f"  Move failed: {fpath} ({e})")
+                self.errors += 1
+                return
+
+        if is_photo:
+            self.moved_photo += 1
+        else:
+            self.moved_other += 1
+
+    def _print_summary(self, elapsed: float):
+        lines = [
+            "",
+            "═" * 54,
+            f"  PHOTO ORGANISER — "
+            f"{'DRY RUN ' if self.dry_run else ''}SUMMARY",
+            "═" * 54,
+            f"  Total images found  : {self.total_images:>10,}",
+            f"  Photos moved        : {self.moved_photo:>10,}",
+        ]
+        if self.filter_photos:
+            lines.append(
+                f"  Non-photos moved    : {self.moved_other:>10,}")
+        lines += [
+            f"  Already in place    : {self.skipped:>10,}",
+            f"  Albums detected     : {len(self.albums_detected):>10,}",
+            f"  Errors              : {self.errors:>10,}",
+        ]
+        if elapsed > 0:
+            lines.append(f"  Elapsed time        : {elapsed:>10.1f} s")
+        lines.append("═" * 54)
+        print("\n".join(lines))
+
+
+# ──────────────────────────────────────────────
 # Progress display
 # ──────────────────────────────────────────────
 class ProgressTracker:
     """
     Maintains running totals and prints a single updating line
     during file copy operations.
-
-    Display format:
-      1,247 / 8,320 files | 3.2 / 14.7 GB | 22% | ETA 12m 34s | photo.jpg
-
-    For large files (>500 MB):
-      Copying large file (2.3 GB): vacation_video.mp4
     """
 
     LARGE_FILE_THRESHOLD = 500 * (1 << 20)  # 500 MB
@@ -580,11 +1005,8 @@ class ProgressTracker:
         self.start_time = time.time()
         self._last_line_len = 0
 
-    def update(self, filename: str, filesize: int, before_copy: bool = False):
-        """
-        Call with before_copy=True right before starting a large file,
-        and with before_copy=False after a file has finished copying.
-        """
+    def update(self, filename: str, filesize: int,
+               before_copy: bool = False):
         if before_copy:
             if filesize >= self.LARGE_FILE_THRESHOLD:
                 self._write(
@@ -610,7 +1032,6 @@ class ProgressTracker:
         else:
             pct = 0
 
-        # Truncate filename to fit
         max_name = 30
         display_name = filename
         if len(display_name) > max_name:
@@ -625,33 +1046,23 @@ class ProgressTracker:
         self._write(line)
 
     def _write(self, line: str):
-        # Pad to overwrite previous line, use \r to stay on same line
         padded = line.ljust(self._last_line_len)
         print(f"\r{padded}", end="", flush=True)
         self._last_line_len = len(line)
 
     def finish(self):
-        """Clear the progress line."""
-        print("\r" + " " * self._last_line_len + "\r", end="", flush=True)
+        print("\r" + " " * self._last_line_len + "\r", end="",
+              flush=True)
 
 
 # ──────────────────────────────────────────────
 # Copier (used by both single and batch modes)
 # ──────────────────────────────────────────────
-
-# How many consecutive space-related skips before auto-aborting
 CONSECUTIVE_SKIP_ABORT = 20
-# Stop if free space drops below this
 MIN_FREE_SPACE = 100 * (1 << 20)  # 100 MB
 
 
 class FileCopier:
-    """
-    Copies files from sources into dest organised by category.
-    Includes pre-flight space check, progress display, and
-    intelligent handling of out-of-space conditions.
-    """
-
     def __init__(self, sources: list[Path], dest: Path,
                  exclude: list[str] | None = None,
                  dedup: bool = True,
@@ -677,20 +1088,17 @@ class FileCopier:
         self.seen_hashes: dict[str, Path] = {}
         self.manifest: list[dict] = []
 
-        # Space tracking
         self._consecutive_space_skips = 0
-        self._space_skip_mode = "ask"  # "ask", "skip", "abort"
+        self._space_skip_mode = "ask"
         self._aborted = False
 
-        # Pre-scan totals (for progress)
         self._scan_total_files = 0
         self._scan_total_bytes = 0
 
     def run(self) -> dict:
-        """Pre-scan, check space, copy with progress, return stats."""
         start_time = time.time()
 
-        # ── Pre-scan: count files and bytes ──
+        # ── Pre-scan ──
         print("  Scanning source(s)...")
         dest_name = self.dest.name
         effective_exclude = self.exclude + [dest_name]
@@ -702,12 +1110,10 @@ class FileCopier:
                     continue
             except (OSError, ValueError):
                 pass
-            # Apply size filters during scan
             if self.min_size and size < self.min_size:
                 continue
             if self.max_size and size > self.max_size:
                 continue
-            # Skip files that don't match any known category
             if get_category(fpath) == "Other":
                 continue
             file_list.append((fpath, size))
@@ -730,12 +1136,14 @@ class FileCopier:
                 shortfall = self._scan_total_bytes - free
                 print()
                 print(f"  ⚠  Not enough space to copy everything.")
-                print(f"     Source total:  {format_bytes(self._scan_total_bytes)}")
+                print(f"     Source total:  "
+                      f"{format_bytes(self._scan_total_bytes)}")
                 print(f"     Free space:    {format_bytes(free)}")
                 print(f"     Shortfall:     {format_bytes(shortfall)}")
                 print()
                 print("  Options:")
-                print("    1. Proceed anyway (files that don't fit will be skipped)")
+                print("    1. Proceed anyway (files that don't fit "
+                      "will be skipped)")
                 print("    2. Abort")
                 print()
                 while True:
@@ -767,15 +1175,11 @@ class FileCopier:
         for fpath, size in file_list:
             if self._aborted:
                 break
-
             self.total_files += 1
             copied = self._process(fpath, size, progress)
-
             if not self.dry_run and copied:
                 progress.update(fpath.name, size)
             elif not self.dry_run and not copied:
-                # Still update count for non-copied files (dupes, existing)
-                # but don't add to bytes — keeps ETA accurate
                 progress.done_files += 1
 
         progress.finish()
@@ -790,13 +1194,10 @@ class FileCopier:
 
     def _process(self, fpath: Path, size: int,
                  progress: ProgressTracker) -> bool:
-        """Process one file. Returns True if copied successfully."""
-
         category = get_category(fpath)
         dest_dir = self.dest / category
         dest_path = dest_dir / fpath.name
 
-        # Dedup
         if self.dedup:
             try:
                 fhash = file_hash(fpath)
@@ -815,35 +1216,31 @@ class FileCopier:
             self.skipped_existing += 1
             return False
 
-        # ── Space check before copy ──
+        # Space check
         if not self.dry_run:
             free = dest_free_space(self.dest)
-
             if free < MIN_FREE_SPACE:
-                print()
-                print(f"\n  ✗ Destination critically low on space "
+                print(f"\n  ✗ Critically low on space "
                       f"({format_bytes(free)} free). Aborting.")
                 self._aborted = True
                 return False
-
             if size > free:
                 return self._handle_space_skip(fpath, size, free)
 
-        # ── Copy ──
         if self.dry_run:
             logging.info(f"[DRY RUN] {fpath}  →  {dest_path}")
         else:
-            # Show large-file notice before copy starts
             progress.update(fpath.name, size, before_copy=True)
             try:
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(fpath), str(dest_path))
             except OSError as e:
-                logging.error(f"Copy failed: {fpath} → {dest_path} ({e})")
+                logging.error(
+                    f"Copy failed: {fpath} → {dest_path} ({e})")
                 self.errors += 1
                 return False
 
-        self._consecutive_space_skips = 0  # reset on successful copy
+        self._consecutive_space_skips = 0
         self.copied_files += 1
         self.bytes_copied += size
         self.category_counts[category] += 1
@@ -857,21 +1254,15 @@ class FileCopier:
 
     def _handle_space_skip(self, fpath: Path, size: int,
                            free: int) -> bool:
-        """
-        Handle a file that won't fit. Returns False (file not copied).
-        May set self._aborted to stop the whole run.
-        """
         self._consecutive_space_skips += 1
         self.skipped_space += 1
 
-        # Auto-abort after too many consecutive skips
         if self._consecutive_space_skips >= CONSECUTIVE_SKIP_ABORT:
             print(f"\n  ✗ {CONSECUTIVE_SKIP_ABORT} consecutive files "
-                  f"skipped for space. Target is full. Aborting.")
+                  f"skipped for space. Aborting.")
             self._aborted = True
             return False
 
-        # First space skip: pause and ask
         if self._space_skip_mode == "ask":
             print()
             print(f"\n  ⚠  Not enough space for: {fpath.name}")
@@ -879,42 +1270,31 @@ class FileCopier:
             print(f"     Free space: {format_bytes(free)}")
             print()
             print("  Options:")
-            print("    1. Skip this file and continue (will skip "
-                  "automatically from now on)")
+            print("    1. Skip this file and continue")
             print("    2. Abort the copy")
-            print("    3. I've freed up space — retry this file")
+            print("    3. I've freed up space — retry")
             print()
             while True:
                 choice = input("  Choose [1/2/3]: ").strip()
                 if choice == "1":
                     self._space_skip_mode = "skip"
-                    print(f"  Skipping. Will auto-skip if this keeps "
-                          f"happening (abort after "
-                          f"{CONSECUTIVE_SKIP_ABORT} in a row).")
                     return False
                 if choice == "2":
                     self._aborted = True
                     return False
                 if choice == "3":
-                    # Re-check space
                     new_free = dest_free_space(self.dest)
                     if size <= new_free:
                         self._consecutive_space_skips = 0
-                        print(f"  Space available now "
-                              f"({format_bytes(new_free)}). Retrying.")
-                        # Return to let the caller try again — but we
-                        # can't easily re-enter _process, so just
-                        # signal that space is fine and let next
-                        # iteration handle it. For this file, we do
-                        # a direct copy here.
-                        return False  # will be handled on re-scan
+                        print(f"  Space available ({format_bytes(new_free)}). "
+                              f"Retrying.")
+                        return False
                     else:
-                        print(f"  Still not enough space "
+                        print(f"  Still not enough "
                               f"({format_bytes(new_free)} free).")
                         continue
                 print("  Please enter 1, 2, or 3.")
 
-        # Already in skip mode
         return False
 
     def _stats(self, elapsed: float) -> dict:
@@ -956,7 +1336,8 @@ class FileCopier:
         if elapsed > 0 and self.bytes_copied > 0:
             speed = self.bytes_copied / elapsed
             lines.append(
-                f"  Average speed       : {format_bytes(int(speed))}/s")
+                f"  Average speed       : "
+                f"{format_bytes(int(speed))}/s")
         if self.category_counts:
             lines.append("")
             for cat in sorted(self.category_counts,
@@ -982,6 +1363,41 @@ class FileCopier:
                 "files": self.manifest,
             }, f, indent=2)
         logging.info(f"Manifest: {manifest_path}")
+
+
+# ──────────────────────────────────────────────
+# Photo organisation setup prompts
+# ──────────────────────────────────────────────
+def _ask_photo_org_settings() -> dict:
+    """Ask the user how they want photos organised. Returns config dict."""
+    print("  How should photos be organised?")
+    print()
+    print("    1. By date (EXIF date taken, file date fallback)")
+    print("    2. By album (auto-detected from source folders)")
+    print("    3. By album with date fallback (album if detected,")
+    print("       otherwise by date)")
+    print()
+    while True:
+        choice = input("  Choose [1/2/3]: ").strip()
+        if choice == "1":
+            strategy = "date"
+            break
+        if choice == "2":
+            strategy = "album"
+            break
+        if choice == "3":
+            strategy = "album_date"
+            break
+        print("  Please enter 1, 2, or 3.")
+
+    print()
+    filter_photos = ask_yes_no(
+        "  Filter real photos from icons/screenshots?\n"
+        "  (Photos go to photo/, everything else to _other/)",
+        default=True,
+    )
+
+    return {"strategy": strategy, "filter_photos": filter_photos}
 
 
 # ──────────────────────────────────────────────
@@ -1047,6 +1463,15 @@ def run_single_backup():
     exclude = _ask_exclusions()
     min_size, max_size = _ask_size_filters()
 
+    # Photo organisation
+    print()
+    organise_photos = ask_yes_no(
+        "Organise photos after copy? (sort by date/album)", default=False)
+    photo_settings = None
+    if organise_photos:
+        print()
+        photo_settings = _ask_photo_org_settings()
+
     print()
     print("─" * 54)
     print(f"  Sources:       {len(sources)} location(s)")
@@ -1055,6 +1480,19 @@ def run_single_backup():
     print(f"  Destination:   {dest}")
     print(f"  Mode:          {'Dry run' if dry_run else 'Live'}")
     print(f"  Dedup on copy: {'Yes' if dedup else 'No'}")
+    if exclude:
+        print(f"  Excluding:     {', '.join(exclude)}")
+    if min_size:
+        print(f"  Min file size: {format_bytes(min_size)}")
+    if max_size:
+        print(f"  Max file size: {format_bytes(max_size)}")
+    if organise_photos and photo_settings:
+        strat_labels = {"date": "By date", "album": "By album",
+                        "album_date": "Album + date fallback"}
+        print(f"  Photo org:     "
+              f"{strat_labels[photo_settings['strategy']]}")
+        print(f"  Photo filter:  "
+              f"{'Yes (photo/ and _other/)' if photo_settings['filter_photos'] else 'No'}")
     print("─" * 54)
     print()
     if not ask_yes_no("Proceed?", default=True):
@@ -1075,7 +1513,23 @@ def run_single_backup():
                 dedup=dedup, min_size=min_size, max_size=max_size,
                 dry_run=False,
             )
-            copier.run()
+            stats = copier.run()
+
+    # Post-copy photo organisation
+    if organise_photos and photo_settings and not dry_run:
+        images_dir = dest / "Images"
+        if images_dir.is_dir():
+            print()
+            print("─" * 54)
+            print("  Starting photo organisation...")
+            print("─" * 54)
+            org = PhotoOrganiser(
+                target=images_dir,
+                strategy=photo_settings["strategy"],
+                filter_photos=photo_settings["filter_photos"],
+                dry_run=True,  # always preview first
+            )
+            org.run()
 
 
 # ──────────────────────────────────────────────
@@ -1122,7 +1576,6 @@ def run_batch_backup(session: BatchSession | None = None):
     # ── Main loop ──
     drive_number = len(session.completed_media) + 1
     baseline_drives = set(str(d) for d in detect_drives())
-    # batch_dry_run is only set for new sessions; resumed sessions go live
     try:
         batch_dry_run
     except NameError:
@@ -1146,7 +1599,8 @@ def run_batch_backup(session: BatchSession | None = None):
         current_drives = detect_drives()
         current_set = set(str(d) for d in current_drives)
         new_drive_paths = current_set - baseline_drives
-        new_drives = [d for d in current_drives if str(d) in new_drive_paths]
+        new_drives = [d for d in current_drives
+                      if str(d) in new_drive_paths]
 
         source = None
 
@@ -1155,7 +1609,8 @@ def run_batch_backup(session: BatchSession | None = None):
             print(f"\n  Detected new drive: {display_drive(candidate)}")
             vid = get_volume_id(candidate)
             if vid in session.completed_volume_ids:
-                print("  This drive was already backed up in this session.")
+                print("  This drive was already backed up in this "
+                      "session.")
                 if not ask_yes_no("  Back it up again?", default=False):
                     continue
             if ask_yes_no("  Use this drive?", default=True):
@@ -1183,7 +1638,8 @@ def run_batch_backup(session: BatchSession | None = None):
         # Label
         default_label = source.name
         print()
-        raw = input(f"  Label for this media [{default_label}]: ").strip()
+        raw = input(
+            f"  Label for this media [{default_label}]: ").strip()
         label = raw if raw else default_label
 
         volume_id = get_volume_id(source)
@@ -1192,6 +1648,12 @@ def run_batch_backup(session: BatchSession | None = None):
         print(f"  Source:      {display_drive(source)}")
         print(f"  Label:       {label}")
         print(f"  Destination: {session.dest}")
+        if session.exclude:
+            print(f"  Excluding:   {', '.join(session.exclude)}")
+        if session.min_size:
+            print(f"  Min size:    {format_bytes(session.min_size)}")
+        if session.max_size:
+            print(f"  Max size:    {format_bytes(session.max_size)}")
         print()
         if not ask_yes_no("  Start copying?", default=True):
             continue
@@ -1210,7 +1672,8 @@ def run_batch_backup(session: BatchSession | None = None):
         # If this was a dry run, offer to go live
         if batch_dry_run:
             print()
-            if ask_yes_no("  Go live and copy these files?", default=True):
+            if ask_yes_no("  Go live and copy these files?",
+                          default=True):
                 copier = FileCopier(
                     sources=[source],
                     dest=session.dest,
@@ -1225,7 +1688,6 @@ def run_batch_backup(session: BatchSession | None = None):
                 print("  Skipped. Moving to next drive.")
                 batch_dry_run = False
                 continue
-            # All subsequent drives go live
             batch_dry_run = False
 
         session.record_media(
@@ -1246,6 +1708,7 @@ def run_batch_backup(session: BatchSession | None = None):
     # ── Session complete ──
     session.print_final_summary()
 
+    # Dedup first, then photo org
     print()
     if ask_yes_no("Run deduplication on the backup folder now?",
                   default=True):
@@ -1254,16 +1717,77 @@ def run_batch_backup(session: BatchSession | None = None):
         deduper = Deduplicator(session.dest, dry_run=dry_run)
         deduper.run()
 
+    images_dir = session.dest / "Images"
+    if images_dir.is_dir():
+        print()
+        if ask_yes_no("Organise photos? (sort by date/album)",
+                      default=False):
+            print()
+            photo_settings = _ask_photo_org_settings()
+            org = PhotoOrganiser(
+                target=images_dir,
+                strategy=photo_settings["strategy"],
+                filter_photos=photo_settings["filter_photos"],
+                dry_run=True,
+            )
+            org.run()
+
     session_path = session.dest / ".batch_session.json"
     if session_path.exists():
-        if ask_yes_no("\nRemove the session file? (can't resume after this)",
-                      default=False):
+        if ask_yes_no(
+                "\nRemove the session file? (can't resume after this)",
+                default=False):
             session_path.unlink()
             print("  Session file removed.")
 
 
 # ──────────────────────────────────────────────
-# Mode 4: Resume
+# Mode 4: Organise photos (standalone)
+# ──────────────────────────────────────────────
+def run_photo_organise():
+    print("─" * 54)
+    print("  ORGANISE PHOTOS")
+    print("  Sort images by date or album. Optionally split")
+    print("  real photos from icons and screenshots.")
+    print("─" * 54)
+    print()
+
+    while True:
+        raw = input(
+            "Which folder contains the images?\n  Path: ").strip()
+        if not raw:
+            print("  A path is required.")
+            continue
+        target = Path(raw).expanduser()
+        if target.is_dir():
+            break
+        print(f"  Not a valid directory: {target}")
+
+    print()
+    photo_settings = _ask_photo_org_settings()
+
+    print()
+    print("─" * 54)
+    print(f"  Target:        {target}")
+    strat_labels = {"date": "By date", "album": "By album",
+                    "album_date": "Album + date fallback"}
+    print(f"  Strategy:      {strat_labels[photo_settings['strategy']]}")
+    print(f"  Photo filter:  "
+          f"{'Yes (photo/ and _other/)' if photo_settings['filter_photos'] else 'No'}")
+    print("─" * 54)
+    print()
+
+    org = PhotoOrganiser(
+        target=target,
+        strategy=photo_settings["strategy"],
+        filter_photos=photo_settings["filter_photos"],
+        dry_run=True,  # always preview first
+    )
+    org.run()
+
+
+# ──────────────────────────────────────────────
+# Mode 5: Resume
 # ──────────────────────────────────────────────
 def run_resume():
     print("─" * 54)
@@ -1312,7 +1836,8 @@ def run_resume():
 # ──────────────────────────────────────────────
 def _ask_dest_path() -> Path:
     while True:
-        raw = input("Destination folder for the backup:\n  Path: ").strip()
+        raw = input(
+            "Destination folder for the backup:\n  Path: ").strip()
         if not raw:
             print("  A destination is required.")
             continue
@@ -1330,9 +1855,11 @@ def _ask_dest_path() -> Path:
 
 def _ask_exclusions() -> list[str]:
     exclude = []
-    if ask_yes_no("Exclude any folder names? (e.g. node_modules, Trash)",
-                  default=False):
-        raw = input("  Folder names to skip (comma-separated): ").strip()
+    if ask_yes_no(
+            "Exclude any folder names? (e.g. node_modules, Trash)",
+            default=False):
+        raw = input(
+            "  Folder names to skip (comma-separated): ").strip()
         exclude = [e.strip() for e in raw.split(",") if e.strip()]
         if exclude:
             print(f"    Excluding: {', '.join(exclude)}")
@@ -1343,13 +1870,15 @@ def _ask_size_filters() -> tuple[int, int]:
     min_size = 0
     max_size = 0
     if ask_yes_no("Set file size filters?", default=False):
-        raw = input("  Minimum file size in MB (Enter to skip): ").strip()
+        raw = input(
+            "  Minimum file size in MB (Enter to skip): ").strip()
         if raw:
             try:
                 min_size = int(float(raw) * 1_048_576)
             except ValueError:
                 pass
-        raw = input("  Maximum file size in MB (Enter to skip): ").strip()
+        raw = input(
+            "  Maximum file size in MB (Enter to skip): ").strip()
         if raw:
             try:
                 max_size = int(float(raw) * 1_048_576)
@@ -1386,16 +1915,20 @@ def main():
     print("     Scan any folder for identical files and remove")
     print("     duplicates, keeping the oldest copy of each.")
     print()
-    print("  4. Resume a batch session")
+    print("  4. Organise photos")
+    print("     Sort images by date or album. Optionally split")
+    print("     real photos from icons and screenshots.")
+    print()
+    print("  5. Resume a batch session")
     print("     Pick up a previous batch backup where you")
     print("     left off.")
     print()
 
     while True:
-        choice = input("Choose [1/2/3/4]: ").strip()
-        if choice in ("1", "2", "3", "4"):
+        choice = input("Choose [1/2/3/4/5]: ").strip()
+        if choice in ("1", "2", "3", "4", "5"):
             break
-        print("  Please enter 1, 2, 3, or 4.")
+        print("  Please enter 1, 2, 3, 4, or 5.")
 
     print()
 
@@ -1406,7 +1939,8 @@ def main():
     elif choice == "3":
         while True:
             raw = input(
-                "Which folder do you want to deduplicate?\n  Path: "
+                "Which folder do you want to deduplicate?\n"
+                "  Path: "
             ).strip()
             if not raw:
                 print("  A path is required.")
@@ -1420,6 +1954,8 @@ def main():
         deduper = Deduplicator(target, dry_run=dry_run)
         deduper.run()
     elif choice == "4":
+        run_photo_organise()
+    elif choice == "5":
         run_resume()
 
 
