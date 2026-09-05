@@ -707,6 +707,9 @@ class FileCopier:
                 continue
             if self.max_size and size > self.max_size:
                 continue
+            # Skip files that don't match any known category
+            if get_category(fpath) == "Other":
+                continue
             file_list.append((fpath, size))
 
         self._scan_total_files = len(file_list)
