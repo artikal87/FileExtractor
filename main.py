@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 backup_organizer.py — Interactively back up multiple drives/directories,
-sorted by file type.
+sorted by file type, with standalone deduplication.
 
 Features:
   • Interactive setup — walks you through every option
@@ -9,7 +9,8 @@ Features:
   • Categorises every file by extension into human-friendly groups
   • Deduplicates using SHA-256 (size pre-check for speed)
   • Preserves original modification timestamps
-  • Dry-run mode to preview without copying
+  • Standalone deduplication mode for any folder
+  • Dry-run mode to preview without copying or deleting
   • Resumable — skips files already present at the destination
   • Generates a detailed log and a final summary report
 
@@ -143,7 +144,7 @@ def scan_sources(sources: list[Path], exclude: list[str] | None = None):
 
 
 # ──────────────────────────────────────────────
-# Interactive setup
+# Helpers
 # ──────────────────────────────────────────────
 def ask_yes_no(prompt: str, default: bool = True) -> bool:
     """Ask a yes/no question and return a boolean."""
@@ -159,30 +160,38 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
         print("  Please enter y or n.")
 
 
+def format_bytes(b: int) -> str:
+    """Human-readable file size."""
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1 << 20:
+        return f"{b / 1024:.1f} KB"
+    elif b < 1 << 30:
+        return f"{b / (1 << 20):.1f} MB"
+    else:
+        return f"{b / (1 << 30):.2f} GB"
+
+
 def detect_drives() -> list[Path]:
     """Try to list mounted drives / volumes for the user's convenience."""
     system = platform.system()
     drives = []
 
     if system == "Windows":
-        # Check common drive letters
         import string
         for letter in string.ascii_uppercase:
             drive = Path(f"{letter}:\\")
             if drive.exists():
                 drives.append(drive)
     elif system == "Darwin":
-        # macOS: list /Volumes
         volumes = Path("/Volumes")
         if volumes.exists():
             drives = sorted([v for v in volumes.iterdir() if v.is_dir()])
     else:
-        # Linux: check /mnt, /media, and /run/media
         for base in [Path("/mnt"), Path("/media"), Path("/run/media")]:
             if base.exists():
                 for item in sorted(base.iterdir()):
                     if item.is_dir():
-                        # /media and /run/media have user subdirs
                         if base.name in ("media", "run") and item.is_dir():
                             for sub in sorted(item.iterdir()):
                                 if sub.is_dir():
@@ -193,181 +202,215 @@ def detect_drives() -> list[Path]:
     return drives
 
 
-def interactive_setup() -> dict:
-    """Walk the user through all options and return a config dict."""
-    print()
-    print("═" * 54)
-    print("  BACKUP ORGANIZER")
-    print("  Consolidate files from multiple drives by type")
-    print("═" * 54)
-    print()
+# ──────────────────────────────────────────────
+# Deduplicator
+# ──────────────────────────────────────────────
+class Deduplicator:
+    """Scan a directory tree and remove duplicate files, keeping the oldest."""
 
-    # ── Detect and show available drives ──
-    detected = detect_drives()
-    if detected:
-        print("Detected drives / volumes:")
-        for i, d in enumerate(detected, 1):
-            try:
-                usage = shutil.disk_usage(d)
-                used_gb = (usage.total - usage.free) / (1 << 30)
-                total_gb = usage.total / (1 << 30)
-                print(f"  {i}. {d}  ({used_gb:.1f} / {total_gb:.1f} GB used)")
-            except OSError:
-                print(f"  {i}. {d}")
+    def __init__(self, target: Path, dry_run: bool = False):
+        self.target = target.resolve()
+        self.dry_run = dry_run
+
+        # Stats
+        self.total_files = 0
+        self.duplicates_found = 0
+        self.bytes_freed = 0
+        self.errors = 0
+        self.groups_found = 0
+
+        # hash → list of (path, mtime, size)
+        self.hash_index: dict[str, list[tuple[Path, float, int]]] = defaultdict(list)
+        # size → list of paths (for fast pre-check)
+        self.size_index: dict[int, list[Path]] = defaultdict(list)
+
+        self.removed: list[dict] = []
+
+    def run(self):
+        start_time = time.time()
         print()
+        logging.info(
+            f"{'DRY RUN — ' if self.dry_run else ''}"
+            f"Deduplicating: {self.target}"
+        )
 
-    # ── Source paths ──
-    print("Which locations do you want to back up?")
-    if detected:
-        print("Enter numbers from the list above, full paths, or a mix.")
-        print("Separate multiple entries with commas, or enter one per line.")
-    else:
-        print("Enter full paths, one per line.")
-    print('Type "done" or press Enter on a blank line when finished.')
-    print()
+        # Pass 1: index all files by size
+        print("  Pass 1: Indexing files by size...")
+        for root, dirs, files in os.walk(self.target, followlinks=False):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fname in files:
+                if fname.startswith("."):
+                    continue
+                fpath = Path(root) / fname
+                if fpath.is_file():
+                    try:
+                        stat = fpath.stat()
+                        self.total_files += 1
+                        self.size_index[stat.st_size].append(fpath)
+                    except OSError:
+                        self.errors += 1
 
-    sources: list[Path] = []
-    while True:
-        prompt = f"  Source #{len(sources) + 1}: " if not sources else f"  Source #{len(sources) + 1} (or Enter to finish): "
-        raw = input(prompt).strip()
+        # Only files with matching sizes need hashing
+        candidates = 0
+        for size, paths in self.size_index.items():
+            if len(paths) > 1 and size > 0:
+                candidates += len(paths)
 
-        if raw.lower() in ("done", "") and sources:
-            break
-        if raw.lower() in ("done", "") and not sources:
-            print("  You need at least one source path.")
-            continue
+        print(f"  Found {self.total_files:,} files, {candidates:,} are potential duplicates (matching sizes).")
 
-        # Handle comma-separated entries
-        entries = [e.strip() for e in raw.split(",") if e.strip()]
-        for entry in entries:
-            # Check if it's a number referencing the detected list
-            if entry.isdigit() and detected:
-                idx = int(entry) - 1
-                if 0 <= idx < len(detected):
-                    sources.append(detected[idx])
-                    print(f"    ✓ Added: {detected[idx]}")
-                else:
-                    print(f"    ✗ Number {entry} is out of range.")
-            else:
-                p = Path(entry).expanduser()
-                if p.exists():
-                    sources.append(p)
-                    print(f"    ✓ Added: {p}")
-                else:
-                    print(f"    ✗ Path not found: {p}")
-                    if ask_yes_no("      Add it anyway? (it may become available later)", default=False):
-                        sources.append(p)
-                        print(f"    ✓ Added: {p}")
+        if candidates == 0:
+            print("  No potential duplicates found. Done.")
+            return
 
-    print()
-
-    # ── Destination path ──
-    while True:
-        raw = input("Where should the organised backup be saved?\n  Destination: ").strip()
-        if not raw:
-            print("  A destination path is required.")
-            continue
-        dest = Path(raw).expanduser()
-        if dest.exists() and not dest.is_dir():
-            print("  That path exists but is not a directory.")
-            continue
-        if not dest.exists():
-            if ask_yes_no(f"  {dest} doesn't exist yet. Create it?", default=True):
-                break
-            else:
+        # Pass 2: hash only the candidates
+        print("  Pass 2: Hashing candidates...")
+        hashed = 0
+        for size, paths in self.size_index.items():
+            if len(paths) <= 1 or size == 0:
                 continue
-        break
+            for fpath in paths:
+                try:
+                    h = file_hash(fpath)
+                    mtime = fpath.stat().st_mtime
+                    self.hash_index[h].append((fpath, mtime, size))
+                    hashed += 1
+                    if hashed % 500 == 0:
+                        logging.info(f"    … hashed {hashed:,} / {candidates:,}")
+                except OSError as e:
+                    logging.warning(f"  Hash error, skipping: {fpath} ({e})")
+                    self.errors += 1
 
-    print()
+        # Pass 3: find groups and pick keepers
+        print("  Pass 3: Identifying duplicates...")
+        for h, entries in self.hash_index.items():
+            if len(entries) <= 1:
+                continue
 
-    # ── Overlap check ──
-    dest_resolved = dest.resolve()
-    for s in sources:
-        try:
-            s_resolved = s.resolve()
-            if dest_resolved == s_resolved or str(dest_resolved).startswith(str(s_resolved) + os.sep):
-                print(f"  ⚠  Warning: destination is inside source {s}.")
-                print(f"     The backup folder itself will be excluded to avoid loops.")
-        except OSError:
-            pass
+            self.groups_found += 1
 
-    # ── Dry run ──
-    dry_run = ask_yes_no(
-        "Do a dry run first? (preview only, no files copied)",
-        default=True,
-    )
-    print()
+            # Keep the file with the oldest modification time (original)
+            entries.sort(key=lambda e: e[1])  # sort by mtime ascending
+            keeper = entries[0]
 
-    # ── Deduplication ──
-    skip_dedup = False
-    if not ask_yes_no(
-        "Enable deduplication? (uses SHA-256 hashing — slower but skips identical files)",
-        default=True,
-    ):
-        skip_dedup = True
-    print()
+            for dupe_path, dupe_mtime, dupe_size in entries[1:]:
+                self.duplicates_found += 1
+                self.bytes_freed += dupe_size
 
-    # ── Exclusions ──
-    exclude = []
-    if ask_yes_no("Exclude any folder names? (e.g. node_modules, .git, Trash)", default=False):
-        raw = input("  Folder names to skip (comma-separated): ").strip()
-        exclude = [e.strip() for e in raw.split(",") if e.strip()]
-        if exclude:
-            print(f"    Will skip folders containing: {', '.join(exclude)}")
-    print()
+                if self.dry_run:
+                    logging.info(
+                        f"  [DRY RUN] Would remove: {dupe_path}\n"
+                        f"            Keeping:      {keeper[0]}"
+                    )
+                else:
+                    try:
+                        dupe_path.unlink()
+                    except OSError as e:
+                        logging.error(f"  Delete failed: {dupe_path} ({e})")
+                        self.errors += 1
+                        self.bytes_freed -= dupe_size
+                        continue
 
-    # ── Size filters ──
-    min_size = 0
-    max_size = 0
-    if ask_yes_no("Set file size filters?", default=False):
-        raw = input("  Minimum file size in MB (Enter to skip): ").strip()
-        if raw:
-            try:
-                min_size = int(float(raw) * 1_048_576)
-                print(f"    Skipping files smaller than {raw} MB")
-            except ValueError:
-                print("    Invalid number, skipping.")
-        raw = input("  Maximum file size in MB (Enter to skip): ").strip()
-        if raw:
-            try:
-                max_size = int(float(raw) * 1_048_576)
-                print(f"    Skipping files larger than {raw} MB")
-            except ValueError:
-                print("    Invalid number, skipping.")
-    print()
+                self.removed.append({
+                    "removed": str(dupe_path),
+                    "kept": str(keeper[0]),
+                    "size": dupe_size,
+                })
 
-    # ── Confirmation ──
-    print("─" * 54)
-    print("  SUMMARY OF SETTINGS")
-    print("─" * 54)
-    print(f"  Sources:")
-    for s in sources:
-        print(f"    • {s}")
-    print(f"  Destination:    {dest}")
-    print(f"  Mode:           {'Dry run (preview)' if dry_run else 'Live (will copy files)'}")
-    print(f"  Deduplication:  {'On' if not skip_dedup else 'Off'}")
-    if exclude:
-        print(f"  Excluding:      {', '.join(exclude)}")
-    if min_size:
-        print(f"  Min file size:  {min_size / 1_048_576:.1f} MB")
-    if max_size:
-        print(f"  Max file size:  {max_size / 1_048_576:.1f} MB")
-    print("─" * 54)
-    print()
+        elapsed = time.time() - start_time
+        self._print_summary(elapsed)
 
-    if not ask_yes_no("Proceed?", default=True):
-        print("Cancelled.")
-        sys.exit(0)
+        # Write dedup report
+        if not self.dry_run and self.removed:
+            self._write_report()
 
-    return {
-        "sources": sources,
-        "dest": dest,
-        "dry_run": dry_run,
-        "exclude": exclude,
-        "skip_dedup": skip_dedup,
-        "min_size": min_size,
-        "max_size": max_size,
-    }
+        # Offer live run after dry run
+        if self.dry_run and self.duplicates_found > 0:
+            print()
+            if ask_yes_no(
+                f"This was a dry run. Delete the {self.duplicates_found:,} "
+                f"duplicates for real and free {format_bytes(self.bytes_freed)}?",
+                default=False,
+            ):
+                self.dry_run = False
+                self.duplicates_found = 0
+                self.bytes_freed = 0
+                self.errors = 0
+                self.groups_found = 0
+                self.removed.clear()
+                # Reuse the hash index — no need to rescan
+                self._delete_from_index()
+
+    def _delete_from_index(self):
+        """Delete duplicates using the already-built hash index."""
+        start_time = time.time()
+        print()
+        logging.info(f"Deleting duplicates from: {self.target}")
+
+        for h, entries in self.hash_index.items():
+            if len(entries) <= 1:
+                continue
+
+            self.groups_found += 1
+            entries.sort(key=lambda e: e[1])
+            keeper = entries[0]
+
+            for dupe_path, dupe_mtime, dupe_size in entries[1:]:
+                if not dupe_path.exists():
+                    continue
+                self.duplicates_found += 1
+                self.bytes_freed += dupe_size
+                try:
+                    dupe_path.unlink()
+                except OSError as e:
+                    logging.error(f"  Delete failed: {dupe_path} ({e})")
+                    self.errors += 1
+                    self.bytes_freed -= dupe_size
+                    continue
+
+                self.removed.append({
+                    "removed": str(dupe_path),
+                    "kept": str(keeper[0]),
+                    "size": dupe_size,
+                })
+
+        elapsed = time.time() - start_time
+        self._print_summary(elapsed)
+        if self.removed:
+            self._write_report()
+
+    def _print_summary(self, elapsed: float):
+        lines = [
+            "",
+            "═" * 54,
+            f"  DEDUPLICATION — {'DRY RUN ' if self.dry_run else ''}SUMMARY",
+            "═" * 54,
+            f"  Total files scanned : {self.total_files:>10,}",
+            f"  Duplicate groups    : {self.groups_found:>10,}",
+            f"  Duplicates {'found' if self.dry_run else 'removed'}   : {self.duplicates_found:>10,}",
+            f"  Space {'reclaimable' if self.dry_run else 'freed'}    : {format_bytes(self.bytes_freed):>10s}",
+            f"  Errors              : {self.errors:>10,}",
+            f"  Elapsed time        : {elapsed:>10.1f} s",
+            "═" * 54,
+        ]
+        print("\n".join(lines))
+
+    def _write_report(self):
+        report_path = self.target / f"dedup_report_{datetime.now():%Y%m%d_%H%M%S}.json"
+        with open(report_path, "w") as f:
+            json.dump(
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "target": str(self.target),
+                    "total_files": self.total_files,
+                    "duplicates_removed": self.duplicates_found,
+                    "bytes_freed": self.bytes_freed,
+                    "errors": self.errors,
+                    "removals": self.removed,
+                },
+                f,
+                indent=2,
+            )
+        logging.info(f"Dedup report written to {report_path}")
 
 
 # ──────────────────────────────────────────────
@@ -383,6 +426,7 @@ class BackupOrganizer:
         skip_dedup: bool = False,
         min_size: int = 0,
         max_size: int = 0,
+        dedup_after: bool = False,
     ):
         self.sources = sources
         self.dest = dest.resolve()
@@ -391,6 +435,7 @@ class BackupOrganizer:
         self.skip_dedup = skip_dedup
         self.min_size = min_size
         self.max_size = max_size
+        self.dedup_after = dedup_after
 
         # Stats
         self.total_files = 0
@@ -404,8 +449,6 @@ class BackupOrganizer:
 
         # Dedup tracking: hash → first source path
         self.seen_hashes: dict[str, Path] = {}
-        # Size index for fast pre-check
-        self.seen_sizes: dict[int, list[Path]] = defaultdict(list)
 
         # Manifest for the run
         self.manifest: list[dict] = []
@@ -445,7 +488,6 @@ class BackupOrganizer:
             self.total_files += 1
             self._process_file(fpath, size)
 
-            # Progress indicator every 500 files
             if self.total_files % 500 == 0:
                 logging.info(
                     f"  … scanned {self.total_files:,} files, "
@@ -474,12 +516,20 @@ class BackupOrganizer:
                 self.bytes_copied = 0
                 self.category_counts.clear()
                 self.seen_hashes.clear()
-                self.seen_sizes.clear()
                 self.manifest.clear()
                 self.run()
+                return  # dedup_after handled by the live run
+
+        # Post-backup deduplication
+        if self.dedup_after and not self.dry_run:
+            print()
+            print("─" * 54)
+            print("  Starting post-backup deduplication...")
+            print("─" * 54)
+            deduper = Deduplicator(self.dest, dry_run=False)
+            deduper.run()
 
     def _process_file(self, fpath: Path, size: int):
-        # Size filter
         if self._is_size_filtered(size):
             self.skipped_size += 1
             return
@@ -488,7 +538,7 @@ class BackupOrganizer:
         dest_dir = self.dest / category
         dest_path = dest_dir / fpath.name
 
-        # Deduplication
+        # In-run deduplication
         if not self.skip_dedup:
             try:
                 fhash = file_hash(fpath)
@@ -520,7 +570,7 @@ class BackupOrganizer:
         else:
             try:
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(fpath), str(dest_path))  # preserves metadata
+                shutil.copy2(str(fpath), str(dest_path))
             except OSError as e:
                 logging.error(f"Copy failed: {fpath} → {dest_path} ({e})")
                 self.errors += 1
@@ -582,6 +632,231 @@ class BackupOrganizer:
 
 
 # ──────────────────────────────────────────────
+# Interactive setup
+# ──────────────────────────────────────────────
+def interactive_setup_backup() -> dict:
+    """Walk the user through backup options and return a config dict."""
+
+    # ── Detect and show available drives ──
+    detected = detect_drives()
+    if detected:
+        print("Detected drives / volumes:")
+        for i, d in enumerate(detected, 1):
+            try:
+                usage = shutil.disk_usage(d)
+                used_gb = (usage.total - usage.free) / (1 << 30)
+                total_gb = usage.total / (1 << 30)
+                print(f"  {i}. {d}  ({used_gb:.1f} / {total_gb:.1f} GB used)")
+            except OSError:
+                print(f"  {i}. {d}")
+        print()
+
+    # ── Source paths ──
+    print("Which locations do you want to back up?")
+    if detected:
+        print("Enter numbers from the list above, full paths, or a mix.")
+        print("Separate multiple entries with commas, or enter one per line.")
+    else:
+        print("Enter full paths, one per line.")
+    print('Type "done" or press Enter on a blank line when finished.')
+    print()
+
+    sources: list[Path] = []
+    while True:
+        prompt = f"  Source #{len(sources) + 1}: " if not sources else f"  Source #{len(sources) + 1} (or Enter to finish): "
+        raw = input(prompt).strip()
+
+        if raw.lower() in ("done", "") and sources:
+            break
+        if raw.lower() in ("done", "") and not sources:
+            print("  You need at least one source path.")
+            continue
+
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+        for entry in entries:
+            if entry.isdigit() and detected:
+                idx = int(entry) - 1
+                if 0 <= idx < len(detected):
+                    sources.append(detected[idx])
+                    print(f"    Added: {detected[idx]}")
+                else:
+                    print(f"    Number {entry} is out of range.")
+            else:
+                p = Path(entry).expanduser()
+                if p.exists():
+                    sources.append(p)
+                    print(f"    Added: {p}")
+                else:
+                    print(f"    Path not found: {p}")
+                    if ask_yes_no("      Add it anyway? (it may become available later)", default=False):
+                        sources.append(p)
+                        print(f"    Added: {p}")
+
+    print()
+
+    # ── Destination path ──
+    while True:
+        raw = input("Where should the organised backup be saved?\n  Destination: ").strip()
+        if not raw:
+            print("  A destination path is required.")
+            continue
+        dest = Path(raw).expanduser()
+        if dest.exists() and not dest.is_dir():
+            print("  That path exists but is not a directory.")
+            continue
+        if not dest.exists():
+            if ask_yes_no(f"  {dest} doesn't exist yet. Create it?", default=True):
+                break
+            else:
+                continue
+        break
+
+    print()
+
+    # ── Overlap check ──
+    dest_resolved = dest.resolve()
+    for s in sources:
+        try:
+            s_resolved = s.resolve()
+            if dest_resolved == s_resolved or str(dest_resolved).startswith(str(s_resolved) + os.sep):
+                print(f"  Warning: destination is inside source {s}.")
+                print(f"     The backup folder itself will be excluded to avoid loops.")
+        except OSError:
+            pass
+
+    # ── Dry run ──
+    dry_run = ask_yes_no(
+        "Do a dry run first? (preview only, no files copied)",
+        default=True,
+    )
+    print()
+
+    # ── In-run deduplication ──
+    skip_dedup = False
+    if not ask_yes_no(
+        "Deduplicate during extraction? (skips identical files across sources)",
+        default=True,
+    ):
+        skip_dedup = True
+    print()
+
+    # ── Post-backup deduplication ──
+    dedup_after = False
+    if ask_yes_no(
+        "Run a final deduplication on the destination after backup?",
+        default=False,
+    ):
+        dedup_after = True
+    print()
+
+    # ── Exclusions ──
+    exclude = []
+    if ask_yes_no("Exclude any folder names? (e.g. node_modules, .git, Trash)", default=False):
+        raw = input("  Folder names to skip (comma-separated): ").strip()
+        exclude = [e.strip() for e in raw.split(",") if e.strip()]
+        if exclude:
+            print(f"    Will skip folders containing: {', '.join(exclude)}")
+    print()
+
+    # ── Size filters ──
+    min_size = 0
+    max_size = 0
+    if ask_yes_no("Set file size filters?", default=False):
+        raw = input("  Minimum file size in MB (Enter to skip): ").strip()
+        if raw:
+            try:
+                min_size = int(float(raw) * 1_048_576)
+                print(f"    Skipping files smaller than {raw} MB")
+            except ValueError:
+                print("    Invalid number, skipping.")
+        raw = input("  Maximum file size in MB (Enter to skip): ").strip()
+        if raw:
+            try:
+                max_size = int(float(raw) * 1_048_576)
+                print(f"    Skipping files larger than {raw} MB")
+            except ValueError:
+                print("    Invalid number, skipping.")
+    print()
+
+    # ── Confirmation ──
+    print("─" * 54)
+    print("  SUMMARY OF SETTINGS")
+    print("─" * 54)
+    print(f"  Sources:")
+    for s in sources:
+        print(f"    • {s}")
+    print(f"  Destination:       {dest}")
+    print(f"  Mode:              {'Dry run (preview)' if dry_run else 'Live (will copy files)'}")
+    print(f"  Dedup on extract:  {'On' if not skip_dedup else 'Off'}")
+    print(f"  Dedup after:       {'On' if dedup_after else 'Off'}")
+    if exclude:
+        print(f"  Excluding:         {', '.join(exclude)}")
+    if min_size:
+        print(f"  Min file size:     {min_size / 1_048_576:.1f} MB")
+    if max_size:
+        print(f"  Max file size:     {max_size / 1_048_576:.1f} MB")
+    print("─" * 54)
+    print()
+
+    if not ask_yes_no("Proceed?", default=True):
+        print("Cancelled.")
+        sys.exit(0)
+
+    return {
+        "sources": sources,
+        "dest": dest,
+        "dry_run": dry_run,
+        "exclude": exclude,
+        "skip_dedup": skip_dedup,
+        "min_size": min_size,
+        "max_size": max_size,
+        "dedup_after": dedup_after,
+    }
+
+
+def interactive_setup_dedup() -> dict:
+    """Walk the user through standalone dedup options."""
+
+    while True:
+        raw = input("Which folder do you want to deduplicate?\n  Path: ").strip()
+        if not raw:
+            print("  A path is required.")
+            continue
+        target = Path(raw).expanduser()
+        if not target.exists():
+            print(f"  Path not found: {target}")
+            continue
+        if not target.is_dir():
+            print("  That's not a directory.")
+            continue
+        break
+
+    print()
+    dry_run = ask_yes_no(
+        "Do a dry run first? (show what would be deleted, without deleting)",
+        default=True,
+    )
+    print()
+
+    print("─" * 54)
+    print("  DEDUP SETTINGS")
+    print("─" * 54)
+    print(f"  Target:  {target}")
+    print(f"  Mode:    {'Dry run (preview)' if dry_run else 'Live (will delete duplicates)'}")
+    print()
+    print("  When duplicates are found, the oldest copy (by")
+    print("  modification date) is kept and the rest are removed.")
+    print("─" * 54)
+    print()
+
+    if not ask_yes_no("Proceed?", default=True):
+        print("Cancelled.")
+        sys.exit(0)
+
+    return {"target": target, "dry_run": dry_run}
+
+
+# ──────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────
 def main():
@@ -591,20 +866,52 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    try:
-        config = interactive_setup()
-    except (KeyboardInterrupt, EOFError):
-        print("\nCancelled.")
-        sys.exit(0)
+    print()
+    print("═" * 54)
+    print("  BACKUP ORGANIZER")
+    print("═" * 54)
+    print()
+    print("What would you like to do?")
+    print()
+    print("  1. Back up and organise files by type")
+    print("  2. Deduplicate an existing folder")
+    print("  3. Back up, then deduplicate the result")
+    print()
 
-    organizer = BackupOrganizer(**config)
+    while True:
+        choice = input("Choose [1/2/3]: ").strip()
+        if choice in ("1", "2", "3"):
+            break
+        print("  Please enter 1, 2, or 3.")
+
+    print()
 
     try:
-        organizer.run()
+        if choice == "1":
+            config = interactive_setup_backup()
+            config["dedup_after"] = False
+            organizer = BackupOrganizer(**config)
+            organizer.run()
+
+        elif choice == "2":
+            config = interactive_setup_dedup()
+            deduper = Deduplicator(**config)
+            deduper.run()
+
+        elif choice == "3":
+            config = interactive_setup_backup()
+            config["dedup_after"] = True
+            organizer = BackupOrganizer(**config)
+            organizer.run()
+
     except KeyboardInterrupt:
-        print("\n\nInterrupted. Run the script again to resume — it will skip already-copied files.")
+        print("\n\nInterrupted. Run the script again to resume.")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        sys.exit(0)
