@@ -151,7 +151,9 @@ def scan_files(sources: list[Path], exclude: list[str] | None = None):
         if not source.exists():
             logging.warning(f"Source does not exist, skipping: {source}")
             continue
-        for root, dirs, files in os.walk(source, followlinks=False):
+        for root, dirs, files in os.walk(source, followlinks=False,
+                                         onerror=lambda e: logging.warning(
+                                             f"Cannot access, skipping: {e}")):
             dirs[:] = [
                 d for d in dirs
                 if not d.startswith(".")
@@ -161,13 +163,14 @@ def scan_files(sources: list[Path], exclude: list[str] | None = None):
                 if fname.startswith("."):
                     continue
                 fpath = Path(root) / fname
-                if fpath.is_file():
-                    try:
-                        size = fpath.stat().st_size
-                    except OSError:
-                        logging.warning(f"Cannot stat, skipping: {fpath}")
+                try:
+                    if not fpath.is_file():
                         continue
-                    yield fpath, size
+                    size = fpath.stat().st_size
+                except OSError:
+                    logging.warning(f"Cannot access, skipping: {fpath}")
+                    continue
+                yield fpath, size
 
 
 # ──────────────────────────────────────────────
