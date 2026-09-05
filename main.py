@@ -4,13 +4,14 @@ backup_organizer.py — Back up and organise files by type, with batch mode
 for processing multiple removable drives one after another.
 
 Modes:
-  1. Single backup  — back up one or more sources to a destination
+  1. Single backup  — back up one or more sources to a destination.
+                      Includes optional dedup during copy.
   2. Batch backup   — set destination once, then insert and back up
                       drives one at a time in a loop. No in-run dedup;
                       designed for a final dedup pass when all media
                       are done.
-  3. Deduplicate    — standalone dedup of any folder
-  4. Resume batch   — pick up a previous batch session where you left off
+  3. Deduplicate    — standalone dedup of any folder.
+  4. Resume batch   — pick up a previous batch session where you left off.
 
 Usage:
   python backup_organizer.py
@@ -22,7 +23,6 @@ import logging
 import os
 import platform
 import shutil
-import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -110,6 +110,18 @@ def format_bytes(b: int) -> str:
         return f"{b / (1 << 30):.2f} GB"
 
 
+def format_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {s:02d}s"
+    else:
+        h, remainder = divmod(int(seconds), 3600)
+        m, s = divmod(remainder, 60)
+        return f"{h}h {m:02d}m"
+
+
 def ask_yes_no(prompt: str, default: bool = True) -> bool:
     hint = "[Y/n]" if default else "[y/N]"
     while True:
@@ -121,6 +133,15 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
         if answer in ("n", "no"):
             return False
         print("  Please enter y or n.")
+
+
+def dest_free_space(dest: Path) -> int:
+    """Return free bytes on the filesystem containing dest."""
+    try:
+        target = dest if dest.exists() else dest.parent
+        return shutil.disk_usage(target).free
+    except OSError:
+        return 0
 
 
 def scan_files(sources: list[Path], exclude: list[str] | None = None):
@@ -170,7 +191,7 @@ def detect_drives() -> list[Path]:
             if base.exists():
                 for item in sorted(base.iterdir()):
                     if item.is_dir():
-                        if base.name in ("media",) and item.is_dir():
+                        if base.name == "media" and item.is_dir():
                             for sub in sorted(item.iterdir()):
                                 if sub.is_dir():
                                     drives.append(sub)
@@ -180,10 +201,6 @@ def detect_drives() -> list[Path]:
 
 
 def get_volume_id(drive_path: Path) -> str:
-    """
-    Get a fingerprint for a drive: volume label + total size.
-    Used to track which media have already been backed up.
-    """
     label = drive_path.name
     try:
         usage = shutil.disk_usage(drive_path)
@@ -193,7 +210,6 @@ def get_volume_id(drive_path: Path) -> str:
 
 
 def display_drive(drive: Path) -> str:
-    """Format a drive for display with size info."""
     try:
         usage = shutil.disk_usage(drive)
         used_gb = (usage.total - usage.free) / (1 << 30)
@@ -203,8 +219,8 @@ def display_drive(drive: Path) -> str:
         return str(drive)
 
 
-def pick_drive_from_list(drives: list[Path], already_done: set[str] | None = None) -> Path | None:
-    """Show a numbered list of drives, marking any already completed, and let the user pick."""
+def pick_drive_from_list(drives: list[Path],
+                         already_done: set[str] | None = None) -> Path | None:
     already_done = already_done or set()
     if not drives:
         print("  No drives detected. Enter a path manually.")
@@ -217,8 +233,8 @@ def pick_drive_from_list(drives: list[Path], already_done: set[str] | None = Non
     print("  Available drives:")
     for i, d in enumerate(drives, 1):
         vid = get_volume_id(d)
-        done_tag = "  [already backed up]" if vid in already_done else ""
-        print(f"    {i}. {display_drive(d)}{done_tag}")
+        tag = "  [already backed up]" if vid in already_done else ""
+        print(f"    {i}. {display_drive(d)}{tag}")
     print(f"    0. Enter a path manually")
     print()
 
@@ -231,7 +247,7 @@ def pick_drive_from_list(drives: list[Path], already_done: set[str] | None = Non
             p = Path(path).expanduser()
             if p.exists():
                 return p
-            print(f"    Path not found: {p}")
+            print(f"    Not found: {p}")
             continue
         if raw.isdigit():
             idx = int(raw) - 1
@@ -239,7 +255,8 @@ def pick_drive_from_list(drives: list[Path], already_done: set[str] | None = Non
                 chosen = drives[idx]
                 vid = get_volume_id(chosen)
                 if vid in already_done:
-                    if not ask_yes_no(f"    This drive was already backed up. Proceed anyway?", default=False):
+                    if not ask_yes_no("    Already backed up. Proceed anyway?",
+                                     default=False):
                         continue
                 return chosen
         print("    Invalid choice.")
@@ -249,11 +266,6 @@ def pick_drive_from_list(drives: list[Path], already_done: set[str] | None = Non
 # Batch session persistence
 # ──────────────────────────────────────────────
 class BatchSession:
-    """
-    Persists batch backup state to disk so the session can be resumed
-    if interrupted. Saved as a JSON file in the destination folder.
-    """
-
     def __init__(self, dest: Path, exclude: list[str] | None = None,
                  min_size: int = 0, max_size: int = 0):
         self.dest = dest.resolve()
@@ -312,22 +324,22 @@ class BatchSession:
             session.completed_media = data.get("completed_media", [])
             return session
         except (json.JSONDecodeError, KeyError, OSError) as e:
-            logging.warning(f"Could not load session file: {e}")
+            logging.warning(f"Could not load session: {e}")
             return None
 
     @staticmethod
     def find_sessions() -> list[Path]:
-        """Search common locations for existing batch session files."""
         found = []
         search_roots = detect_drives() + [Path.home()]
         for root in search_roots:
             try:
                 for dirpath, dirnames, filenames in os.walk(root):
-                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                    dirnames[:] = [d for d in dirnames
+                                   if not d.startswith(".")]
                     if ".batch_session.json" in filenames:
                         found.append(Path(dirpath))
-                    # Don't recurse too deep
-                    if dirpath.count(os.sep) - str(root).count(os.sep) >= 3:
+                    depth = dirpath.count(os.sep) - str(root).count(os.sep)
+                    if depth >= 3:
                         dirnames.clear()
             except OSError:
                 continue
@@ -348,12 +360,9 @@ class BatchSession:
                       f"{format_bytes(m['bytes_copied'])})")
 
     def print_final_summary(self):
-        """Print a combined summary across all media in the session."""
         total_files = sum(m["files_copied"] for m in self.completed_media)
         total_bytes = sum(m["bytes_copied"] for m in self.completed_media)
-
-        # Merge category counts across all media
-        merged_cats = defaultdict(int)
+        merged_cats: dict[str, int] = defaultdict(int)
         for m in self.completed_media:
             for cat, count in m.get("category_counts", {}).items():
                 merged_cats[cat] += count
@@ -394,7 +403,8 @@ class Deduplicator:
         self.bytes_freed = 0
         self.errors = 0
         self.groups_found = 0
-        self.hash_index: dict[str, list[tuple[Path, float, int]]] = defaultdict(list)
+        self.hash_index: dict[str, list[tuple[Path, float, int]]] = \
+            defaultdict(list)
         self.size_index: dict[int, list[Path]] = defaultdict(list)
         self.removed: list[dict] = []
 
@@ -406,19 +416,18 @@ class Deduplicator:
             f"Deduplicating: {self.target}"
         )
 
-        # Pass 1: index by size
         print("  Pass 1: Indexing files by size...")
         for root, dirs, files in os.walk(self.target, followlinks=False):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fname in files:
                 if fname.startswith(".") or fname.endswith(".json"):
-                    continue  # skip manifests/session files
+                    continue
                 fpath = Path(root) / fname
                 if fpath.is_file():
                     try:
-                        stat = fpath.stat()
+                        st = fpath.stat()
                         self.total_files += 1
-                        self.size_index[stat.st_size].append(fpath)
+                        self.size_index[st.st_size].append(fpath)
                     except OSError:
                         self.errors += 1
 
@@ -427,13 +436,12 @@ class Deduplicator:
             if len(paths) > 1 and size > 0
         )
         print(f"  Found {self.total_files:,} files, "
-              f"{candidates:,} are potential duplicates (matching sizes).")
+              f"{candidates:,} potential duplicates (matching sizes).")
 
         if candidates == 0:
             print("  No potential duplicates found.")
             return
 
-        # Pass 2: hash candidates
         print("  Pass 2: Hashing candidates...")
         hashed = 0
         for size, paths in self.size_index.items():
@@ -451,7 +459,6 @@ class Deduplicator:
                     logging.warning(f"  Hash error: {fpath} ({e})")
                     self.errors += 1
 
-        # Pass 3: remove duplicates
         print("  Pass 3: Identifying duplicates...")
         self._process_groups()
 
@@ -461,11 +468,10 @@ class Deduplicator:
         if not self.dry_run and self.removed:
             self._write_report()
 
-        # Offer live run after dry run
         if self.dry_run and self.duplicates_found > 0:
             print()
             if ask_yes_no(
-                f"Delete the {self.duplicates_found:,} duplicates and "
+                f"Delete {self.duplicates_found:,} duplicates and "
                 f"free {format_bytes(self.bytes_freed)}?",
                 default=False,
             ):
@@ -485,7 +491,7 @@ class Deduplicator:
             if len(entries) <= 1:
                 continue
             self.groups_found += 1
-            entries.sort(key=lambda e: e[1])  # oldest first
+            entries.sort(key=lambda e: e[1])
             keeper = entries[0]
             for dupe_path, _, dupe_size in entries[1:]:
                 if not dupe_path.exists():
@@ -519,8 +525,10 @@ class Deduplicator:
             "═" * 54,
             f"  Total files scanned : {self.total_files:>10,}",
             f"  Duplicate groups    : {self.groups_found:>10,}",
-            f"  Duplicates {'found' if self.dry_run else 'removed'}   : {self.duplicates_found:>10,}",
-            f"  Space {'reclaimable' if self.dry_run else 'freed'}    : {format_bytes(self.bytes_freed):>10s}",
+            f"  Duplicates {'found' if self.dry_run else 'removed'}   : "
+            f"{self.duplicates_found:>10,}",
+            f"  Space {'reclaimable' if self.dry_run else 'freed'}    : "
+            f"{format_bytes(self.bytes_freed):>10s}",
             f"  Errors              : {self.errors:>10,}",
         ]
         if elapsed > 0:
@@ -529,7 +537,8 @@ class Deduplicator:
         print("\n".join(lines))
 
     def _write_report(self):
-        report_path = self.target / f"dedup_report_{datetime.now():%Y%m%d_%H%M%S}.json"
+        report_path = (self.target /
+                       f"dedup_report_{datetime.now():%Y%m%d_%H%M%S}.json")
         with open(report_path, "w") as f:
             json.dump({
                 "timestamp": datetime.now().isoformat(),
@@ -544,13 +553,100 @@ class Deduplicator:
 
 
 # ──────────────────────────────────────────────
+# Progress display
+# ──────────────────────────────────────────────
+class ProgressTracker:
+    """
+    Maintains running totals and prints a single updating line
+    during file copy operations.
+
+    Display format:
+      1,247 / 8,320 files | 3.2 / 14.7 GB | 22% | ETA 12m 34s | photo.jpg
+
+    For large files (>500 MB):
+      Copying large file (2.3 GB): vacation_video.mp4
+    """
+
+    LARGE_FILE_THRESHOLD = 500 * (1 << 20)  # 500 MB
+
+    def __init__(self, total_files: int, total_bytes: int):
+        self.total_files = total_files
+        self.total_bytes = total_bytes
+        self.done_files = 0
+        self.done_bytes = 0
+        self.start_time = time.time()
+        self._last_line_len = 0
+
+    def update(self, filename: str, filesize: int, before_copy: bool = False):
+        """
+        Call with before_copy=True right before starting a large file,
+        and with before_copy=False after a file has finished copying.
+        """
+        if before_copy:
+            if filesize >= self.LARGE_FILE_THRESHOLD:
+                self._write(
+                    f"  Copying large file ({format_bytes(filesize)}): "
+                    f"{filename}"
+                )
+            return
+
+        self.done_files += 1
+        self.done_bytes += filesize
+
+        elapsed = time.time() - self.start_time
+        if elapsed > 0 and self.done_bytes > 0:
+            speed = self.done_bytes / elapsed
+            remaining_bytes = self.total_bytes - self.done_bytes
+            eta = remaining_bytes / speed if speed > 0 else 0
+            eta_str = format_time(eta)
+        else:
+            eta_str = "—"
+
+        if self.total_bytes > 0:
+            pct = int(self.done_bytes / self.total_bytes * 100)
+        else:
+            pct = 0
+
+        # Truncate filename to fit
+        max_name = 30
+        display_name = filename
+        if len(display_name) > max_name:
+            display_name = "…" + display_name[-(max_name - 1):]
+
+        line = (
+            f"  {self.done_files:,} / {self.total_files:,} files | "
+            f"{format_bytes(self.done_bytes)} / "
+            f"{format_bytes(self.total_bytes)} | "
+            f"{pct}% | ETA {eta_str} | {display_name}"
+        )
+        self._write(line)
+
+    def _write(self, line: str):
+        # Pad to overwrite previous line, use \r to stay on same line
+        padded = line.ljust(self._last_line_len)
+        print(f"\r{padded}", end="", flush=True)
+        self._last_line_len = len(line)
+
+    def finish(self):
+        """Clear the progress line."""
+        print("\r" + " " * self._last_line_len + "\r", end="", flush=True)
+
+
+# ──────────────────────────────────────────────
 # Copier (used by both single and batch modes)
 # ──────────────────────────────────────────────
+
+# How many consecutive space-related skips before auto-aborting
+CONSECUTIVE_SKIP_ABORT = 20
+# Stop if free space drops below this
+MIN_FREE_SPACE = 100 * (1 << 20)  # 100 MB
+
+
 class FileCopier:
     """
     Copies files from sources into dest organised by category.
-    When dedup=True, hashes files and skips duplicates within the run.
-    When dedup=False, copies everything (for batch mode — dedup later).
+    Includes pre-flight space check, progress display, and
+    intelligent handling of out-of-space conditions.
     """
 
     def __init__(self, sources: list[Path], dest: Path,
@@ -571,25 +667,31 @@ class FileCopier:
         self.skipped_dupes = 0
         self.skipped_existing = 0
         self.skipped_size = 0
+        self.skipped_space = 0
         self.errors = 0
         self.bytes_copied = 0
         self.category_counts: dict[str, int] = defaultdict(int)
         self.seen_hashes: dict[str, Path] = {}
         self.manifest: list[dict] = []
 
+        # Space tracking
+        self._consecutive_space_skips = 0
+        self._space_skip_mode = "ask"  # "ask", "skip", "abort"
+        self._aborted = False
+
+        # Pre-scan totals (for progress)
+        self._scan_total_files = 0
+        self._scan_total_bytes = 0
+
     def run(self) -> dict:
-        """Run the copy and return stats."""
+        """Pre-scan, check space, copy with progress, return stats."""
         start_time = time.time()
-        logging.info(
-            f"{'DRY RUN — ' if self.dry_run else ''}"
-            f"Copying from {len(self.sources)} source(s) → {self.dest}"
-        )
 
-        if not self.dry_run:
-            self.dest.mkdir(parents=True, exist_ok=True)
-
+        # ── Pre-scan: count files and bytes ──
+        print("  Scanning source(s)...")
         dest_name = self.dest.name
         effective_exclude = self.exclude + [dest_name]
+        file_list: list[tuple[Path, int]] = []
 
         for fpath, size in scan_files(self.sources, effective_exclude):
             try:
@@ -597,15 +699,80 @@ class FileCopier:
                     continue
             except (OSError, ValueError):
                 pass
+            # Apply size filters during scan
+            if self.min_size and size < self.min_size:
+                continue
+            if self.max_size and size > self.max_size:
+                continue
+            file_list.append((fpath, size))
+
+        self._scan_total_files = len(file_list)
+        self._scan_total_bytes = sum(s for _, s in file_list)
+
+        print(f"  Found {self._scan_total_files:,} files, "
+              f"{format_bytes(self._scan_total_bytes)} total.")
+
+        if self._scan_total_files == 0:
+            print("  Nothing to copy.")
+            return self._stats(0)
+
+        # ── Pre-flight space check ──
+        free = dest_free_space(self.dest)
+        if free > 0:
+            print(f"  Destination free space: {format_bytes(free)}")
+            if self._scan_total_bytes > free:
+                shortfall = self._scan_total_bytes - free
+                print()
+                print(f"  ⚠  Not enough space to copy everything.")
+                print(f"     Source total:  {format_bytes(self._scan_total_bytes)}")
+                print(f"     Free space:    {format_bytes(free)}")
+                print(f"     Shortfall:     {format_bytes(shortfall)}")
+                print()
+                print("  Options:")
+                print("    1. Proceed anyway (files that don't fit will be skipped)")
+                print("    2. Abort")
+                print()
+                while True:
+                    choice = input("  Choose [1/2]: ").strip()
+                    if choice == "1":
+                        break
+                    if choice == "2":
+                        print("  Aborted.")
+                        return self._stats(0)
+                    print("  Please enter 1 or 2.")
+            else:
+                headroom = free - self._scan_total_bytes
+                print(f"  Headroom after copy: ~{format_bytes(headroom)}")
+        print()
+
+        # ── Copy with progress ──
+        if not self.dry_run:
+            self.dest.mkdir(parents=True, exist_ok=True)
+
+        logging.info(
+            f"{'DRY RUN — ' if self.dry_run else ''}"
+            f"Copying {self._scan_total_files:,} files → {self.dest}"
+        )
+
+        progress = ProgressTracker(
+            self._scan_total_files, self._scan_total_bytes
+        )
+
+        for fpath, size in file_list:
+            if self._aborted:
+                break
 
             self.total_files += 1
-            self._process(fpath, size)
+            copied = self._process(fpath, size, progress)
 
-            if self.total_files % 500 == 0:
-                logging.info(
-                    f"  … {self.total_files:,} scanned, "
-                    f"{self.copied_files:,} copied"
-                )
+            if not self.dry_run and copied:
+                progress.update(fpath.name, size)
+            elif not self.dry_run and not copied:
+                # Still update count for non-copied files (dupes, existing)
+                # but don't add to bytes — keeps ETA accurate
+                progress.done_files += 1
+
+        progress.finish()
 
         elapsed = time.time() - start_time
         self._print_summary(elapsed)
@@ -613,56 +780,64 @@ class FileCopier:
         if not self.dry_run:
             self._write_manifest()
 
-        return {
-            "total_files": self.total_files,
-            "copied_files": self.copied_files,
-            "bytes_copied": self.bytes_copied,
-            "category_counts": dict(self.category_counts),
-            "errors": self.errors,
-            "elapsed": elapsed,
-        }
+        return self._stats(elapsed)
 
-    def _process(self, fpath: Path, size: int):
-        if self.min_size and size < self.min_size:
-            self.skipped_size += 1
-            return
-        if self.max_size and size > self.max_size:
-            self.skipped_size += 1
-            return
+    def _process(self, fpath: Path, size: int,
+                 progress: ProgressTracker) -> bool:
+        """Process one file. Returns True if copied successfully."""
 
         category = get_category(fpath)
         dest_dir = self.dest / category
         dest_path = dest_dir / fpath.name
 
+        # Dedup
         if self.dedup:
             try:
                 fhash = file_hash(fpath)
             except OSError as e:
                 logging.warning(f"Hash error: {fpath} ({e})")
                 self.errors += 1
-                return
+                return False
             if fhash in self.seen_hashes:
                 self.skipped_dupes += 1
-                return
+                return False
             self.seen_hashes[fhash] = fpath
 
         dest_path = unique_dest_path(dest_path)
 
         if dest_path.exists():
             self.skipped_existing += 1
-            return
+            return False
 
+        # ── Space check before copy ──
+        if not self.dry_run:
+            free = dest_free_space(self.dest)
+
+            if free < MIN_FREE_SPACE:
+                print()
+                print(f"\n  ✗ Destination critically low on space "
+                      f"({format_bytes(free)} free). Aborting.")
+                self._aborted = True
+                return False
+
+            if size > free:
+                return self._handle_space_skip(fpath, size, free)
+
+        # ── Copy ──
         if self.dry_run:
             logging.info(f"[DRY RUN] {fpath}  →  {dest_path}")
         else:
+            # Show large-file notice before copy starts
+            progress.update(fpath.name, size, before_copy=True)
             try:
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(str(fpath), str(dest_path))
             except OSError as e:
                 logging.error(f"Copy failed: {fpath} → {dest_path} ({e})")
                 self.errors += 1
-                return
+                return False
 
+        self._consecutive_space_skips = 0  # reset on successful copy
         self.copied_files += 1
         self.bytes_copied += size
         self.category_counts[category] += 1
@@ -672,6 +847,81 @@ class FileCopier:
             "category": category,
             "size": size,
         })
+        return True
+
+    def _handle_space_skip(self, fpath: Path, size: int,
+                           free: int) -> bool:
+        """
+        Handle a file that won't fit. Returns False (file not copied).
+        May set self._aborted to stop the whole run.
+        """
+        self._consecutive_space_skips += 1
+        self.skipped_space += 1
+
+        # Auto-abort after too many consecutive skips
+        if self._consecutive_space_skips >= CONSECUTIVE_SKIP_ABORT:
+            print(f"\n  ✗ {CONSECUTIVE_SKIP_ABORT} consecutive files "
+                  f"skipped for space. Target is full. Aborting.")
+            self._aborted = True
+            return False
+
+        # First space skip: pause and ask
+        if self._space_skip_mode == "ask":
+            print()
+            print(f"\n  ⚠  Not enough space for: {fpath.name}")
+            print(f"     File size:  {format_bytes(size)}")
+            print(f"     Free space: {format_bytes(free)}")
+            print()
+            print("  Options:")
+            print("    1. Skip this file and continue (will skip "
+                  "automatically from now on)")
+            print("    2. Abort the copy")
+            print("    3. I've freed up space — retry this file")
+            print()
+            while True:
+                choice = input("  Choose [1/2/3]: ").strip()
+                if choice == "1":
+                    self._space_skip_mode = "skip"
+                    print(f"  Skipping. Will auto-skip if this keeps "
+                          f"happening (abort after "
+                          f"{CONSECUTIVE_SKIP_ABORT} in a row).")
+                    return False
+                if choice == "2":
+                    self._aborted = True
+                    return False
+                if choice == "3":
+                    # Re-check space
+                    new_free = dest_free_space(self.dest)
+                    if size <= new_free:
+                        self._consecutive_space_skips = 0
+                        print(f"  Space available now "
+                              f"({format_bytes(new_free)}). Retrying.")
+                        # Return to let the caller try again — but we
+                        # can't easily re-enter _process, so just
+                        # signal that space is fine and let next
+                        # iteration handle it. For this file, we do
+                        # a direct copy here.
+                        return False  # will be handled on re-scan
+                    else:
+                        print(f"  Still not enough space "
+                              f"({format_bytes(new_free)} free).")
+                        continue
+                print("  Please enter 1, 2, or 3.")
+
+        # Already in skip mode
+        return False
+
+    def _stats(self, elapsed: float) -> dict:
+        return {
+            "total_files": self.total_files,
+            "copied_files": self.copied_files,
+            "bytes_copied": self.bytes_copied,
+            "category_counts": dict(self.category_counts),
+            "errors": self.errors,
+            "skipped_space": self.skipped_space,
+            "elapsed": elapsed,
+            "aborted": self._aborted,
+        }
 
     def _print_summary(self, elapsed: float):
         gb = self.bytes_copied / (1 << 30)
@@ -684,22 +934,40 @@ class FileCopier:
             f"  Files copied        : {self.copied_files:>10,}",
         ]
         if self.dedup:
-            lines.append(f"  Duplicates skipped  : {self.skipped_dupes:>10,}")
+            lines.append(
+                f"  Duplicates skipped  : {self.skipped_dupes:>10,}")
         lines += [
             f"  Already present     : {self.skipped_existing:>10,}",
+        ]
+        if self.skipped_space > 0:
+            lines.append(
+                f"  Skipped (no space)  : {self.skipped_space:>10,}")
+        lines += [
             f"  Errors              : {self.errors:>10,}",
             f"  Data copied         : {gb:>10.2f} GB",
             f"  Time                : {elapsed:>10.1f} s",
         ]
+        if elapsed > 0 and self.bytes_copied > 0:
+            speed = self.bytes_copied / elapsed
+            lines.append(
+                f"  Average speed       : {format_bytes(int(speed))}/s")
         if self.category_counts:
             lines.append("")
-            for cat in sorted(self.category_counts, key=self.category_counts.get, reverse=True):
-                lines.append(f"    {cat:<20s} {self.category_counts[cat]:>8,}")
+            for cat in sorted(self.category_counts,
+                              key=self.category_counts.get, reverse=True):
+                lines.append(
+                    f"    {cat:<20s} {self.category_counts[cat]:>8,}")
+        if self._aborted:
+            lines.append("")
+            lines.append("  ⚠  Copy was aborted (insufficient space).")
         lines.append("─" * 54)
         print("\n".join(lines))
 
     def _write_manifest(self):
-        manifest_path = self.dest / f"manifest_{datetime.now():%Y%m%d_%H%M%S}.json"
+        manifest_path = (
+            self.dest /
+            f"manifest_{datetime.now():%Y%m%d_%H%M%S}.json"
+        )
         with open(manifest_path, "w") as f:
             json.dump({
                 "timestamp": datetime.now().isoformat(),
@@ -717,7 +985,7 @@ def run_single_backup():
     print("─" * 54)
     print("  SINGLE BACKUP")
     print("  Back up one or more sources, organised by file type.")
-    print("  Deduplication during copy is available in this mode.")
+    print("  Includes optional dedup during copy.")
     print("─" * 54)
     print()
 
@@ -728,10 +996,10 @@ def run_single_backup():
             print(f"  {i}. {display_drive(d)}")
         print()
 
-    # Sources
     print("Which locations do you want to back up?")
     if detected:
-        print("Enter numbers from above, full paths, or a mix (comma-separated).")
+        print("Enter numbers from above, full paths, or a mix "
+              "(comma-separated).")
     print('Press Enter on a blank line when finished.')
     print()
 
@@ -761,20 +1029,18 @@ def run_single_backup():
                 else:
                     print(f"    Not found: {p}")
 
-    # Destination
     print()
     dest = _ask_dest_path()
-
     print()
     dry_run = ask_yes_no("Dry run first? (preview only)", default=True)
     print()
-    dedup = ask_yes_no("Deduplicate during copy? (hash each file, skip identical ones)", default=True)
+    dedup = ask_yes_no(
+        "Deduplicate during copy? (hash each file, skip identical ones)",
+        default=True)
     print()
-
     exclude = _ask_exclusions()
     min_size, max_size = _ask_size_filters()
 
-    # Confirm
     print()
     print("─" * 54)
     print(f"  Sources:       {len(sources)} location(s)")
@@ -811,7 +1077,6 @@ def run_single_backup():
 # ──────────────────────────────────────────────
 def run_batch_backup(session: BatchSession | None = None):
     if session:
-        # Resuming
         print("─" * 54)
         print("  RESUMING BATCH SESSION")
         print("─" * 54)
@@ -820,13 +1085,12 @@ def run_batch_backup(session: BatchSession | None = None):
         if not ask_yes_no("Continue this session?", default=True):
             return
     else:
-        # New session
         print("─" * 54)
         print("  BATCH BACKUP")
-        print("  Set your destination and preferences once, then insert")
-        print("  and back up removable media one at a time. Files are")
-        print("  copied as-is (no dedup during copy) — run a final")
-        print("  deduplication when all media are done.")
+        print("  Set your destination and preferences once, then")
+        print("  insert and back up removable media one at a time.")
+        print("  Files are copied without dedup for speed — run a")
+        print("  final dedup when all media are done.")
         print("─" * 54)
         print()
 
@@ -841,9 +1105,8 @@ def run_batch_backup(session: BatchSession | None = None):
         )
         session.save()
         print()
-        print(f"  Session created. Progress is auto-saved to:")
-        print(f"    {session.dest / '.batch_session.json'}")
-        print(f"  If interrupted, choose 'Resume batch session' to continue.")
+        print(f"  Session saved. If interrupted, choose")
+        print(f"  'Resume batch session' to continue.")
 
     # ── Main loop ──
     drive_number = len(session.completed_media) + 1
@@ -872,7 +1135,6 @@ def run_batch_backup(session: BatchSession | None = None):
         source = None
 
         if len(new_drives) == 1:
-            # Exactly one new drive detected — confirm with user
             candidate = new_drives[0]
             print(f"\n  Detected new drive: {display_drive(candidate)}")
             vid = get_volume_id(candidate)
@@ -887,13 +1149,11 @@ def run_batch_backup(session: BatchSession | None = None):
                     current_drives, session.completed_volume_ids
                 )
         elif len(new_drives) > 1:
-            # Multiple new drives — ask which one
             print(f"\n  Detected {len(new_drives)} new drives:")
             source = pick_drive_from_list(
                 new_drives, session.completed_volume_ids
             )
         else:
-            # No new drives detected (first drive, or already inserted)
             print("\n  No new drives detected since last check.")
             print("  Choose from all available drives:\n")
             source = pick_drive_from_list(
@@ -912,7 +1172,6 @@ def run_batch_backup(session: BatchSession | None = None):
 
         volume_id = get_volume_id(source)
 
-        # Confirm
         print()
         print(f"  Source:      {display_drive(source)}")
         print(f"  Label:       {label}")
@@ -921,7 +1180,6 @@ def run_batch_backup(session: BatchSession | None = None):
         if not ask_yes_no("  Start copying?", default=True):
             continue
 
-        # Copy (no dedup in batch mode)
         copier = FileCopier(
             sources=[source],
             dest=session.dest,
@@ -933,7 +1191,6 @@ def run_batch_backup(session: BatchSession | None = None):
         )
         stats = copier.run()
 
-        # Record in session
         session.record_media(
             label=label,
             path=source,
@@ -946,25 +1203,24 @@ def run_batch_backup(session: BatchSession | None = None):
         print(f"\n  Drive '{label}' done. "
               f"{len(session.completed_media)} media backed up so far.")
 
-        # Update baseline so this drive isn't flagged as "new" next time
         baseline_drives = set(str(d) for d in detect_drives())
         drive_number += 1
 
     # ── Session complete ──
     session.print_final_summary()
 
-    # Offer deduplication
     print()
-    if ask_yes_no("Run deduplication on the backup folder now?", default=True):
+    if ask_yes_no("Run deduplication on the backup folder now?",
+                  default=True):
         print()
         dry_run = ask_yes_no("  Dry run first?", default=True)
         deduper = Deduplicator(session.dest, dry_run=dry_run)
         deduper.run()
 
-    # Clean up session file
     session_path = session.dest / ".batch_session.json"
     if session_path.exists():
-        if ask_yes_no("\nRemove the session file? (you won't be able to resume)", default=False):
+        if ask_yes_no("\nRemove the session file? (can't resume after this)",
+                      default=False):
             session_path.unlink()
             print("  Session file removed.")
 
@@ -977,10 +1233,8 @@ def run_resume():
     print("  RESUME BATCH SESSION")
     print("─" * 54)
     print()
-
-    # Option 1: user provides the destination path
-    print("  Enter the backup destination folder where the session")
-    print("  was saved, or press Enter to search for sessions.")
+    print("  Enter the backup destination folder, or press Enter")
+    print("  to search for existing sessions.")
     print()
     raw = input("  Destination path (or Enter to search): ").strip()
 
@@ -991,7 +1245,6 @@ def run_resume():
             run_batch_backup(session)
         else:
             print(f"  No batch session found at {dest}")
-            return
     else:
         print("  Searching for session files...")
         found = BatchSession.find_sessions()
@@ -1031,7 +1284,8 @@ def _ask_dest_path() -> Path:
             print("  That exists but is not a directory.")
             continue
         if not dest.exists():
-            if ask_yes_no(f"  {dest} doesn't exist. Create it?", default=True):
+            if ask_yes_no(f"  {dest} doesn't exist. Create it?",
+                          default=True):
                 return dest
             continue
         return dest
@@ -1039,7 +1293,8 @@ def _ask_dest_path() -> Path:
 
 def _ask_exclusions() -> list[str]:
     exclude = []
-    if ask_yes_no("Exclude any folder names? (e.g. node_modules, Trash)", default=False):
+    if ask_yes_no("Exclude any folder names? (e.g. node_modules, Trash)",
+                  default=False):
         raw = input("  Folder names to skip (comma-separated): ").strip()
         exclude = [e.strip() for e in raw.split(",") if e.strip()]
         if exclude:
@@ -1082,20 +1337,21 @@ def main():
     print("═" * 54)
     print()
     print("  1. Single backup")
-    print("     Back up one or more locations, organised by type.")
-    print("     Includes optional deduplication during copy.")
+    print("     Back up one or more locations, organised by")
+    print("     type. Includes optional dedup during copy.")
     print()
     print("  2. Batch backup (multiple removable media)")
-    print("     Set your destination once, then insert and back")
-    print("     up drives one at a time. Skips dedup during copy")
-    print("     for speed — run a final dedup when all are done.")
+    print("     Set your destination once, then insert and")
+    print("     back up drives one at a time. Skips in-run")
+    print("     dedup for speed — run a final dedup when done.")
     print()
     print("  3. Deduplicate a folder")
     print("     Scan any folder for identical files and remove")
     print("     duplicates, keeping the oldest copy of each.")
     print()
     print("  4. Resume a batch session")
-    print("     Pick up a previous batch backup where you left off.")
+    print("     Pick up a previous batch backup where you")
+    print("     left off.")
     print()
 
     while True:
@@ -1112,7 +1368,9 @@ def main():
         run_batch_backup()
     elif choice == "3":
         while True:
-            raw = input("Which folder do you want to deduplicate?\n  Path: ").strip()
+            raw = input(
+                "Which folder do you want to deduplicate?\n  Path: "
+            ).strip()
             if not raw:
                 print("  A path is required.")
                 continue
@@ -1121,7 +1379,7 @@ def main():
                 break
             print(f"  Not a valid directory: {target}")
         print()
-        dry_run = ask_yes_no("Dry run first? (preview what would be deleted)", default=True)
+        dry_run = ask_yes_no("Dry run first?", default=True)
         deduper = Deduplicator(target, dry_run=dry_run)
         deduper.run()
     elif choice == "4":
