@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-backup_organizer.py — Back up and organise files by type, with batch mode
+backup_organiser.py — Back up and organise files by type, with batch mode
 for processing multiple removable drives one after another.
 
 Modes:
@@ -14,7 +14,7 @@ Modes:
   4. Resume batch   — pick up a previous batch session where you left off.
 
 Usage:
-  python backup_organizer.py
+  python backup_organiser.py
 """
 
 import hashlib
@@ -1099,6 +1099,11 @@ def run_batch_backup(session: BatchSession | None = None):
         exclude = _ask_exclusions()
         min_size, max_size = _ask_size_filters()
 
+        print()
+        batch_dry_run = ask_yes_no(
+            "Dry run the first drive? (preview before committing)",
+            default=True)
+
         session = BatchSession(
             dest=dest, exclude=exclude,
             min_size=min_size, max_size=max_size,
@@ -1111,6 +1116,11 @@ def run_batch_backup(session: BatchSession | None = None):
     # ── Main loop ──
     drive_number = len(session.completed_media) + 1
     baseline_drives = set(str(d) for d in detect_drives())
+    # batch_dry_run is only set for new sessions; resumed sessions go live
+    try:
+        batch_dry_run
+    except NameError:
+        batch_dry_run = False
 
     while True:
         print()
@@ -1187,9 +1197,30 @@ def run_batch_backup(session: BatchSession | None = None):
             dedup=False,
             min_size=session.min_size,
             max_size=session.max_size,
-            dry_run=False,
+            dry_run=batch_dry_run,
         )
         stats = copier.run()
+
+        # If this was a dry run, offer to go live
+        if batch_dry_run:
+            print()
+            if ask_yes_no("  Go live and copy these files?", default=True):
+                copier = FileCopier(
+                    sources=[source],
+                    dest=session.dest,
+                    exclude=session.exclude,
+                    dedup=False,
+                    min_size=session.min_size,
+                    max_size=session.max_size,
+                    dry_run=False,
+                )
+                stats = copier.run()
+            else:
+                print("  Skipped. Moving to next drive.")
+                batch_dry_run = False
+                continue
+            # All subsequent drives go live
+            batch_dry_run = False
 
         session.record_media(
             label=label,
@@ -1333,7 +1364,7 @@ def main():
 
     print()
     print("═" * 54)
-    print("  BACKUP ORGANISER v1.0")
+    print("  BACKUP ORGANISER v1.1")
     print("═" * 54)
     print()
     print("  1. Single backup")
