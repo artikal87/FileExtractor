@@ -327,9 +327,13 @@ def pick_drive_from_list(drives: list[Path],
 # ──────────────────────────────────────────────
 class BatchSession:
     def __init__(self, dest: Path, exclude: list[str] | None = None,
+                 exclude_ext: list[str] | None = None,
+                 include_categories: list[str] | None = None,
                  min_size: int = 0, max_size: int = 0):
         self.dest = dest.resolve()
         self.exclude = exclude or []
+        self.exclude_ext = exclude_ext or []
+        self.include_categories = include_categories or list(_ALL_CATEGORIES)
         self.min_size = min_size
         self.max_size = max_size
         self.started = datetime.now().isoformat()
@@ -361,6 +365,8 @@ class BatchSession:
                 "started": self.started,
                 "destination": str(self.dest),
                 "exclude": self.exclude,
+                "exclude_ext": self.exclude_ext,
+                "include_categories": self.include_categories,
                 "min_size": self.min_size,
                 "max_size": self.max_size,
                 "completed_media": self.completed_media,
@@ -377,6 +383,8 @@ class BatchSession:
             session = cls(
                 dest=dest,
                 exclude=data.get("exclude", []),
+                exclude_ext=data.get("exclude_ext", []),
+                include_categories=data.get("include_categories"),
                 min_size=data.get("min_size", 0),
                 max_size=data.get("max_size", 0),
             )
@@ -720,42 +728,66 @@ class PhotoOrganiser:
                 self._print_summary(0)
 
     def _load_manifests(self):
-        """Load manifest files to map destination filenames to source paths."""
-        for item in self.target.iterdir():
-            if item.name.startswith("manifest_") and item.suffix == ".json":
-                try:
-                    with open(item) as f:
-                        data = json.load(f)
-                    for entry in data.get("files", []):
-                        dest_path = Path(entry.get("destination", ""))
-                        source_path = entry.get("source", "")
-                        if dest_path.name and source_path:
-                            self._source_map[dest_path.name] = source_path
-                except (json.JSONDecodeError, OSError):
-                    continue
+        """Load manifest files to map destination paths to source paths.
+        Searches both the target directory and its parent (since manifests
+        are written to the backup root, not the Images subfolder)."""
+        manifest_dirs = [self.target]
+        if self.target.parent != self.target:
+            manifest_dirs.append(self.target.parent)
+
+        loaded = 0
+        for search_dir in manifest_dirs:
+            if not search_dir.is_dir():
+                continue
+            for item in search_dir.iterdir():
+                if (item.name.startswith("manifest_")
+                        and item.suffix == ".json"):
+                    try:
+                        with open(item) as f:
+                            data = json.load(f)
+                        for entry in data.get("files", []):
+                            dest_str = entry.get("destination", "")
+                            source_str = entry.get("source", "")
+                            if not dest_str or not source_str:
+                                continue
+                            dest_path = Path(dest_str)
+                            # Skip files that no longer exist (removed by dedup)
+                            if not dest_path.exists():
+                                continue
+                            # Key by full resolved path to avoid collisions
+                            self._source_map[str(dest_path.resolve())] = source_str
+                            loaded += 1
+                    except (json.JSONDecodeError, OSError):
+                        continue
         if self._source_map:
             print(f"  Loaded source paths for {len(self._source_map):,} "
-                  f"files from manifests.")
+                  f"files from manifests ({loaded:,} entries).")
 
     def _detect_albums(self, images: list[Path]) -> dict[str, str]:
         """
         Detect album folders using manifest source paths (preferred)
-        or current folder structure. Returns filename → album name.
+        or current folder structure. Returns resolved_dest_path → album name.
         """
         album_map: dict[str, str] = {}
 
+        # Set of resolved paths that actually exist on disk
+        live_images = {str(p.resolve()) for p in images}
+
         if self._source_map:
             # Group by source parent directory
+            # dir_files: source_dir → list of resolved dest paths
             dir_files: dict[str, list[str]] = defaultdict(list)
             dir_total: dict[str, int] = defaultdict(int)
             dir_images: dict[str, int] = defaultdict(int)
 
-            for fname, source_path in self._source_map.items():
+            for dest_resolved, source_path in self._source_map.items():
                 parent = str(Path(source_path).parent)
                 dir_total[parent] += 1
-                if Path(fname).suffix.lower() in IMAGE_EXTENSIONS:
-                    dir_images[parent] += 1
-                    dir_files[parent].append(fname)
+                if Path(source_path).suffix.lower() in IMAGE_EXTENSIONS:
+                    # Only count files still on disk
+                    if dest_resolved in live_images:
+                        dir_images[parent] += 1
+                        dir_files[parent].append(dest_resolved)
 
             for parent, img_count in dir_images.items():
                 total = dir_total[parent]
@@ -763,7 +795,6 @@ class PhotoOrganiser:
                 if (img_count >= ALBUM_MIN_IMAGES
                         and density >= ALBUM_DENSITY_THRESHOLD):
                     album_name = Path(parent).name
-                    # Clean up album name
                     album_name = album_name.strip().replace(" ", "_")
                     if album_name:
                         self.albums_detected.append({
@@ -772,8 +803,8 @@ class PhotoOrganiser:
                             "density": density,
                             "source_dir": parent,
                         })
-                        for fname in dir_files[parent]:
-                            album_map[fname] = album_name
+                        for dest_resolved in dir_files[parent]:
+                            album_map[dest_resolved] = album_name
 
         else:
             # No manifests — use current folder structure
@@ -802,7 +833,8 @@ class PhotoOrganiser:
                         })
                         for fname in img_files:
                             fpath = Path(root) / fname
-                            album_map[fpath.name] = album_name
+                            resolved = str(fpath.resolve())
+                            album_map[resolved] = album_name
 
         return album_map
 
@@ -911,7 +943,7 @@ class PhotoOrganiser:
         # Choose subfolder based on strategy (only for photos or
         # unfiltered mode)
         if is_photo or not self.filter_photos:
-            album_name = album_map.get(fpath.name)
+            album_name = album_map.get(str(fpath.resolve()))
 
             if self.strategy == "album" and album_name:
                 dest_dir = base / album_name
@@ -1065,16 +1097,26 @@ MIN_FREE_SPACE = 100 * (1 << 20)  # 100 MB
 class FileCopier:
     def __init__(self, sources: list[Path], dest: Path,
                  exclude: list[str] | None = None,
+                 exclude_ext: list[str] | None = None,
+                 include_categories: list[str] | None = None,
                  dedup: bool = True,
                  min_size: int = 0, max_size: int = 0,
-                 dry_run: bool = False):
+                 dry_run: bool = False,
+                 label: str = ""):
         self.sources = sources
         self.dest = dest.resolve()
         self.exclude = exclude or []
+        self.exclude_ext = set(
+            (e if e.startswith(".") else f".{e}").lower()
+            for e in (exclude_ext or [])
+        )
+        self.include_categories = set(
+            include_categories) if include_categories else None
         self.dedup = dedup
         self.min_size = min_size
         self.max_size = max_size
         self.dry_run = dry_run
+        self.label = label
 
         self.total_files = 0
         self.copied_files = 0
@@ -1114,7 +1156,12 @@ class FileCopier:
                 continue
             if self.max_size and size > self.max_size:
                 continue
-            if get_category(fpath) == "Other":
+            cat = get_category(fpath)
+            if self.include_categories and cat not in self.include_categories:
+                continue
+            if cat == "Other":
+                continue
+            if self.exclude_ext and fpath.suffix.lower() in self.exclude_ext:
                 continue
             file_list.append((fpath, size))
 
@@ -1356,12 +1403,15 @@ class FileCopier:
             f"manifest_{datetime.now():%Y%m%d_%H%M%S}.json"
         )
         with open(manifest_path, "w") as f:
-            json.dump({
+            data = {
                 "timestamp": datetime.now().isoformat(),
                 "sources": [str(s) for s in self.sources],
                 "destination": str(self.dest),
                 "files": self.manifest,
-            }, f, indent=2)
+            }
+            if self.label:
+                data["label"] = self.label
+            json.dump(data, f, indent=2)
         logging.info(f"Manifest: {manifest_path}")
 
 
@@ -1454,6 +1504,8 @@ def run_single_backup():
     print()
     dest = _ask_dest_path()
     print()
+    categories = _ask_categories()
+    print()
     dry_run = ask_yes_no("Dry run first? (preview only)", default=True)
     print()
     dedup = ask_yes_no(
@@ -1461,6 +1513,7 @@ def run_single_backup():
         default=True)
     print()
     exclude = _ask_exclusions()
+    exclude_ext = _ask_ext_exclusions()
     min_size, max_size = _ask_size_filters()
 
     # Photo organisation
@@ -1478,10 +1531,14 @@ def run_single_backup():
     for s in sources:
         print(f"                   {s}")
     print(f"  Destination:   {dest}")
+    all_cats = len(categories) == len(_ALL_CATEGORIES)
+    print(f"  Categories:    {'All' if all_cats else ', '.join(categories)}")
     print(f"  Mode:          {'Dry run' if dry_run else 'Live'}")
     print(f"  Dedup on copy: {'Yes' if dedup else 'No'}")
     if exclude:
-        print(f"  Excluding:     {', '.join(exclude)}")
+        print(f"  Excl. folders: {', '.join(exclude)}")
+    if exclude_ext:
+        print(f"  Excl. types:   {', '.join(exclude_ext)}")
     if min_size:
         print(f"  Min file size: {format_bytes(min_size)}")
     if max_size:
@@ -1500,6 +1557,7 @@ def run_single_backup():
 
     copier = FileCopier(
         sources=sources, dest=dest, exclude=exclude,
+        exclude_ext=exclude_ext, include_categories=categories,
         dedup=dedup, min_size=min_size, max_size=max_size,
         dry_run=dry_run,
     )
@@ -1510,6 +1568,7 @@ def run_single_backup():
         if ask_yes_no("Run it for real?", default=True):
             copier = FileCopier(
                 sources=sources, dest=dest, exclude=exclude,
+                exclude_ext=exclude_ext, include_categories=categories,
                 dedup=dedup, min_size=min_size, max_size=max_size,
                 dry_run=False,
             )
@@ -1556,7 +1615,10 @@ def run_batch_backup(session: BatchSession | None = None):
 
         dest = _ask_dest_path()
         print()
+        categories = _ask_categories()
+        print()
         exclude = _ask_exclusions()
+        exclude_ext = _ask_ext_exclusions()
         min_size, max_size = _ask_size_filters()
 
         print()
@@ -1565,7 +1627,8 @@ def run_batch_backup(session: BatchSession | None = None):
             default=True)
 
         session = BatchSession(
-            dest=dest, exclude=exclude,
+            dest=dest, exclude=exclude, exclude_ext=exclude_ext,
+            include_categories=categories,
             min_size=min_size, max_size=max_size,
         )
         session.save()
@@ -1648,8 +1711,12 @@ def run_batch_backup(session: BatchSession | None = None):
         print(f"  Source:      {display_drive(source)}")
         print(f"  Label:       {label}")
         print(f"  Destination: {session.dest}")
+        all_cats = len(session.include_categories) == len(_ALL_CATEGORIES)
+        print(f"  Categories:  {'All' if all_cats else ', '.join(session.include_categories)}")
         if session.exclude:
-            print(f"  Excluding:   {', '.join(session.exclude)}")
+            print(f"  Excl. folders: {', '.join(session.exclude)}")
+        if session.exclude_ext:
+            print(f"  Excl. types: {', '.join(session.exclude_ext)}")
         if session.min_size:
             print(f"  Min size:    {format_bytes(session.min_size)}")
         if session.max_size:
@@ -1662,10 +1729,13 @@ def run_batch_backup(session: BatchSession | None = None):
             sources=[source],
             dest=session.dest,
             exclude=session.exclude,
+            exclude_ext=session.exclude_ext,
+            include_categories=session.include_categories,
             dedup=False,
             min_size=session.min_size,
             max_size=session.max_size,
             dry_run=batch_dry_run,
+            label=label,
         )
         stats = copier.run()
 
@@ -1678,10 +1748,13 @@ def run_batch_backup(session: BatchSession | None = None):
                     sources=[source],
                     dest=session.dest,
                     exclude=session.exclude,
+                    exclude_ext=session.exclude_ext,
+                    include_categories=session.include_categories,
                     dedup=False,
                     min_size=session.min_size,
                     max_size=session.max_size,
                     dry_run=False,
+                    label=label,
                 )
                 stats = copier.run()
             else:
@@ -1885,6 +1958,53 @@ def _ask_size_filters() -> tuple[int, int]:
             except ValueError:
                 pass
     return min_size, max_size
+
+
+def _ask_ext_exclusions() -> list[str]:
+    exclude_ext: list[str] = []
+    if ask_yes_no("Exclude any file types? (e.g. .gz, .mkv)",
+                  default=False):
+        raw = input(
+            "  Extensions to skip (comma-separated): ").strip()
+        exclude_ext = [e.strip() for e in raw.split(",") if e.strip()]
+        if exclude_ext:
+            # Normalise: ensure leading dot
+            exclude_ext = [
+                e if e.startswith(".") else f".{e}"
+                for e in exclude_ext
+            ]
+            print(f"    Excluding: {', '.join(exclude_ext)}")
+    return exclude_ext
+
+
+# All selectable category names in display order
+_ALL_CATEGORIES = list(FILE_CATEGORIES.keys())
+
+
+def _ask_categories() -> list[str]:
+    """Let the user choose which file type categories to extract."""
+    print("  Which file types do you want to extract?")
+    print("  Enter numbers separated by commas, or Enter for all.")
+    print()
+    for i, cat in enumerate(_ALL_CATEGORIES, 1):
+        print(f"    {i}. {cat}")
+    print()
+    raw = input("  Categories [all]: ").strip()
+    if not raw:
+        print(f"    Selected: all")
+        return list(_ALL_CATEGORIES)
+    chosen = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            idx = int(part) - 1
+            if 0 <= idx < len(_ALL_CATEGORIES):
+                chosen.append(_ALL_CATEGORIES[idx])
+    if not chosen:
+        print("    No valid selection. Using all categories.")
+        return list(_ALL_CATEGORIES)
+    print(f"    Selected: {', '.join(chosen)}")
+    return chosen
 
 
 # ──────────────────────────────────────────────
